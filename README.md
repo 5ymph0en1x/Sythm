@@ -1,5 +1,9 @@
 # Sythm
 
+<p align="center">
+  <img src="pic.png" width="75%" alt="sample"/>
+</p>
+
 **Real-time, audio-reactive 3D particle visualizer** — Python + GLSL, built for an **RTX 4090**.
 
 Sythm captures, in *loopback*, the sound coming out of your speakers (Spotify, YouTube, a game…),
