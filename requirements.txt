@@ -1,0 +1,52 @@
+# =============================================================================
+#  Sythm — Dépendances Python
+#  ---------------------------------------------------------------------------
+#  Visualiseur de particules 3D audio-réactif temps réel pour RTX 4090.
+#
+#  Installation recommandée (rapide, isolée) avec uv :
+#       uv pip install -r requirements.txt
+#  ou avec pip classique :
+#       pip install -r requirements.txt
+#
+#  PRÉREQUIS HORS-PIP (voir README.md) :
+#    - Pilote NVIDIA récent + CUDA Toolkit 13.x (pour cupy-cuda13x / pycuda)
+#      avec CUDA_PATH défini (cf. README, section dépannage).
+#    - Un GPU NVIDIA (conçu et réglé pour une RTX 4090 ; fonctionne sur d'autres
+#      cartes RTX avec un N_PARTICLES réduit).
+#    - Une source audio en LOOPBACK (WASAPI sous Windows, moniteur PulseAudio/
+#      PipeWire sous Linux).
+# =============================================================================
+
+# --- Rendu / fenêtre / contexte OpenGL --------------------------------------
+# moderngl : wrapper OpenGL 4.6 moderne (buffers, FBO, shaders, compute).
+moderngl>=5.8
+# glfw : création de fenêtre + contexte OpenGL multiplateforme (préféré).
+glfw>=2.6
+
+# --- Calcul GPU (simulation des particules + FFT audio sur GPU) -------------
+# cupy : NumPy sur GPU CUDA. Choisir la roue correspondant à votre CUDA :
+#   - CUDA 13.x -> cupy-cuda13x  (par défaut ci-dessous ; machine de réf. RTX 4090)
+#   - CUDA 12.x -> remplacer par cupy-cuda12x
+cupy-cuda13x>=14.0
+# pycuda : PLUS REQUIS. L'interop CUDA<->OpenGL se fait désormais en direct via
+# l'API DRIVER CUDA appelée en ctypes (cuGraphicsGLRegisterBuffer & co.), sans
+# PyCUDA — dont les wheels n'embarquent généralement pas le support GL. Laissé
+# en commentaire pour mémoire / dépannage.
+# pycuda>=2024.1
+
+# --- Audio ------------------------------------------------------------------
+# soundcard : capture loopback de la sortie système (WASAPI / PulseAudio).
+soundcard>=0.4.3
+
+# --- Numérique --------------------------------------------------------------
+numpy>=1.24
+
+# --- Optionnel --------------------------------------------------------------
+# pyrr : utilitaires de matrices/quaternions (caméra, projection). Le Renderer
+# peut fonctionner sans (matrices calculées à la main) ; décommentez si utilisé.
+# pyrr>=0.10.3
+
+# --- Alternative audio Windows (optionnelle) --------------------------------
+# Si 'soundcard' pose problème pour le loopback WASAPI sous Windows, on peut
+# basculer sur PyAudioWPatch (fork de PyAudio avec support loopback WASAPI).
+# pyaudiowpatch>=0.2.12
