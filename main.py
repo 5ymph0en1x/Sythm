@@ -74,8 +74,8 @@ EMIT_RATE = 5.0           # émissions par particule d'origine et par seconde
 # True  -> plein écran sur le moniteur primaire (résolution native).
 # False -> fenêtré redimensionnable de taille WINDOW_W x WINDOW_H.
 FULLSCREEN = False
-WINDOW_W = 1920
-WINDOW_H = 1080
+WINDOW_W = 1280
+WINDOW_H = 720
 
 # SUPERSAMPLING interne : on rend à (résolution_écran * SUPERSAMPLE_FACTOR) puis
 # on réduit à l'affichage -> anti-aliasing « gratuit » et particules très nettes.
@@ -109,6 +109,29 @@ EXPOSURE = 0.15                # exposition basse : ADAPTÉE à ~35M (grain net,
 ENABLE_DENOISE = True
 DENOISE_SIGMA = 0.01            # force ; + grand = + lisse (mais filaments moins nets)
 DENOISE_ITERS = 7             # nb de passes à-trous (+ = rayon large, + lisse)
+
+
+# --- ENREGISTREMENT (touche R) — H.265 ---------------------------------------
+# La touche R démarre/arrête l'enregistrement de la diffusion en HEVC, avec le
+# ffmpeg fourni par imageio-ffmpeg (aucune install système). Fichier .mp4 écrit
+# dans RECORD_DIR, à cadence fixe. L'écriture se fait dans un thread dédié : la
+# boucle de rendu n'est jamais figée par l'encodeur.
+RECORD_ENCODER = "x265"        # "x265" = encodeur LOGICIEL (qualité MAX, + lent ; bien
+                               #   meilleur sur notre contenu sombre/granuleux : préserve
+                               #   le grain et les filaments au lieu de les lisser).
+                               #   "nvenc" = encodeur MATÉRIEL GPU (temps réel garanti).
+RECORD_FPS = 30                # images/s de la vidéo (pacing horloge -> timing correct).
+                               #   NB : le visuel n'avance qu'au rythme du RENDU ; au-delà,
+                               #   les images sont DUPLIQUÉES.
+RECORD_DIR = "."               # dossier de sortie des enregistrements
+RECORD_QUALITY = 16            # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
+                               #   x265 : ~18 = excellent, ~16 = quasi transparent.
+RECORD_PRESET = "faster"       # x265 : ultrafast..placebo (medium = bon équilibre ; si trop
+                               #   de frames sont droppées, passe à "fast"/"faster").
+                               #   nvenc : p1..p7 (p7 = meilleure qualité).
+RECORD_PIXFMT = "p010"  # 10 bits 4:2:0 (Main10, tue le banding). Autres :
+                               #   "yuv444p10le" = 4:4:4 (chroma pleine, filaments nets) ;
+                               #   "yuv420p" = 8 bits (ancien comportement).
 
 
 # --- CAMÉRA ------------------------------------------------------------------
@@ -233,6 +256,7 @@ def main():
         from particles import ParticleSystem
         from postfx import PostProcessor
         from audio_engine import AudioEngine
+        from recorder import Recorder
     except ImportError as exc:
         print("[main] Import d'un module du projet impossible :", exc,
               file=sys.stderr)
@@ -250,6 +274,7 @@ def main():
     particles = None
     postfx = None
     audio = None
+    loop_state = None
 
     try:
         # =====================================================================
@@ -368,6 +393,43 @@ def main():
             # Temps écoulé depuis le démarrage (alimente caméra & animation).
             t = now - t_start
 
+            # --- Bascules différées (traitées hors callback GLFW) ------------
+            # F : plein écran borderless (change la taille -> resize géré juste après).
+            if loop_state.toggle_fullscreen:
+                loop_state.toggle_fullscreen = False
+                window.toggle_fullscreen()
+            # R : démarre / arrête l'enregistrement HEVC (x265/NVENC).
+            if loop_state.toggle_record:
+                loop_state.toggle_record = False
+                if loop_state.recorder is None:
+                    # Dimensions du framebuffer FINAL réellement lu par le recorder.
+                    sw, sh = ctx.screen.size
+                    try:
+                        loop_state.recorder = Recorder(
+                            sw, sh, RECORD_FPS, RECORD_DIR, RECORD_ENCODER,
+                            RECORD_QUALITY, RECORD_PRESET, RECORD_PIXFMT)
+                        print(f"[record] ● REC {sw}x{sh} {RECORD_ENCODER}/"
+                              f"{RECORD_PIXFMT} (HEVC q{RECORD_QUALITY}) -> "
+                              f"{loop_state.recorder.path}", file=sys.stderr)
+                    except Exception as exc:
+                        print(f"[record] démarrage impossible : {exc}", file=sys.stderr)
+                        loop_state.recorder = None
+                else:
+                    rec = loop_state.recorder
+                    loop_state.recorder = None
+                    path, nframes = rec.close()
+                    extra = (f", {rec.dropped} droppées"
+                             if getattr(rec, "dropped", 0) else "")
+                    print(f"[record] ■ sauvegardé : {path} "
+                          f"({nframes} frames{extra})", file=sys.stderr)
+                    if getattr(rec, "dropped", 0):
+                        print("[record] ⚠ encodeur en retard : baisse "
+                              "RECORD_PRESET (ex. 'fast') ou la résolution.",
+                              file=sys.stderr)
+                    if getattr(rec, "last_error", None):
+                        print(f"[record] ⚠ ffmpeg : {rec.last_error}",
+                              file=sys.stderr)
+
             # --- Redimensionnement éventuel (fenêtré) ------------------------
             if window.resized:
                 new_w, new_h = window.size
@@ -390,6 +452,10 @@ def main():
 
             # --- 4) Post-traitement -> framebuffer écran ---------------------
             postfx.process(hdr_tex, ctx.screen)
+
+            # --- 4b) Capture vidéo (si enregistrement actif), AVANT le swap ---
+            if loop_state.recorder is not None:
+                loop_state.recorder.maybe_capture(ctx.screen)
 
             # --- 5) Présentation + événements + FPS --------------------------
             window.swap_buffers()
@@ -415,6 +481,9 @@ def main():
         #  NETTOYAGE  — toujours exécuté, dans l'ordre inverse de construction.
         # =====================================================================
         print("[main] Nettoyage des ressources...", file=sys.stderr)
+        _safe_call(lambda: loop_state.recorder.close()
+                   if (loop_state is not None and loop_state.recorder is not None)
+                   else None, "recorder.close()")
         _safe_call(lambda: audio.stop() if audio is not None else None,
                    "audio.stop()")
         _safe_call(lambda: particles.release() if particles is not None else None,
@@ -436,6 +505,9 @@ class _LoopState:
         self.camera_mode = CAMERA_MODE
         self.enable_bloom = ENABLE_BLOOM
         self.enable_motion_blur = ENABLE_MOTION_BLUR
+        self.toggle_fullscreen = False   # demande de bascule plein écran (touche F)
+        self.toggle_record = False       # demande de bascule enregistrement (touche R)
+        self.recorder = None             # Recorder actif (None = pas d'enregistrement)
 
 
 # Liste ordonnée des modes caméra pour le cyclage avec la touche C.
@@ -487,13 +559,21 @@ def _install_key_toggles(window, state, postfx, renderer):
                            "renderer.set_camera_mode")
             print(f"[touche] Caméra : {state.camera_mode}")
 
+        # F -> plein écran borderless (différé : appliqué dans la boucle de rendu).
+        elif glfw is not None and key == glfw.KEY_F:
+            state.toggle_fullscreen = True
+
+        # R -> démarre / arrête l'enregistrement HEVC x265/NVENC (différé).
+        elif glfw is not None and key == glfw.KEY_R:
+            state.toggle_record = True
+
     # Branche le callback si l'API optionnelle est disponible.
     if hasattr(window, "set_extra_key_callback"):
         window.set_extra_key_callback(on_extra_key)
     else:
         # window.py minimal : on ne peut pas brancher les toggles. On le note.
         print("[main] (info) window.set_extra_key_callback absent : les touches "
-              "B/M/C sont inactives. ESC fonctionne toujours.", file=sys.stderr)
+              "B/M/C/F/R sont inactives. ESC fonctionne toujours.", file=sys.stderr)
 
 
 def _update_title(window, fps_value, state):
@@ -505,8 +585,10 @@ def _update_title(window, fps_value, state):
         return
     bloom = "B" if state.enable_bloom else "-"
     mblur = "M" if state.enable_motion_blur else "-"
+    rec = "  ● REC" if getattr(state, "recorder", None) is not None else ""
+    fs = "FS " if getattr(window, "is_fullscreen", False) else ""
     title = (f"Sythm | {fps_value:5.1f} FPS | {N_PARTICLES:,} part. | "
-             f"[{bloom}{mblur}] cam:{state.camera_mode}")
+             f"[{bloom}{mblur}] {fs}cam:{state.camera_mode}{rec}")
     if getattr(window, "handle", None) is not None:
         glfw.set_window_title(window.handle, title)
 
@@ -530,6 +612,8 @@ def _print_controls():
         "  B   : activer/désactiver le bloom\n"
         "  M   : activer/désactiver le motion blur\n"
         "  C   : changer de mode caméra (fixed / auto_rotate / beat_reactive)\n"
+        "  F   : plein écran borderless (HDR préservé) (bascule)\n"
+        "  R   : démarrer/arrêter l'enregistrement HEVC (x265/NVENC)\n"
         "============================\n",
         file=sys.stderr,
     )

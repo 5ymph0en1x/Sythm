@@ -1,9 +1,5 @@
 # Sythm
 
-<p align="center">
-  <img src="pic.png" width="75%" alt="sample"/>
-</p>
-
 **Real-time, audio-reactive 3D particle visualizer** — Python + GLSL, built for an **RTX 4090**.
 
 Sythm captures, in *loopback*, the sound coming out of your speakers (Spotify, YouTube, a game…),
@@ -97,8 +93,33 @@ Play some music on your default output and enjoy.
 | `B`   | Toggle **bloom** |
 | `M`   | Toggle **motion blur** |
 | `C`   | Cycle **camera mode** (`fixed` → `auto_rotate` → `beat_reactive`) |
+| `F`   | Toggle **borderless fullscreen** (HDR-preserving) |
+| `R`   | Start/stop **recording** (**H.265/HEVC** → `.mp4`) |
 
-The window title shows the live FPS, particle count and effect state.
+The window title shows the live FPS, particle count, effect state, and a `● REC` marker while recording.
+
+**Fullscreen (`F`)** uses a **borderless** window covering the monitor — *not* exclusive fullscreen.
+On Windows, an exclusive OpenGL app with no HDR surface forces the display into SDR (it looks like
+"HDR turned off"); borderless keeps the DWM compositor in charge, so the screen stays in HDR.
+
+**Recording (`R`)** encodes HEVC through the `ffmpeg` binary bundled with `imageio-ffmpeg` — no system
+ffmpeg needed. Files go to `RECORD_DIR` as `sythm-<timestamp>.mp4`. Capture is **frame-paced** at a
+fixed `RECORD_FPS`, and writing happens on a **background thread** so the encoder never stalls the
+render loop (if it can't keep up, frames are dropped rather than freezing the app).
+
+Two encoders, via `RECORD_ENCODER`:
+
+- **`"x265"` (default)** — software **libx265**. Far better than hardware encoders on this
+  **dark, fine-grained, high-frequency** content: `psy-rd`/`psy-rdoq` preserve the grain and the thin
+  filaments instead of smearing them into a washed-out blur, and `aq-mode=3` steers bits toward the
+  dark areas. Quality via `RECORD_QUALITY` (CRF, ~18 = excellent). If you see dropped frames at the
+  end, lower `RECORD_PRESET` (`fast`/`faster`) or the resolution.
+- **`"nvenc"`** — hardware `hevc_nvenc` (guaranteed real-time on the GPU); good for high resolutions
+  where x265 can't sustain the frame rate.
+
+Both encode **10-bit** by default (`RECORD_PIXFMT = "yuv420p10le"` → HEVC *Main10*, which kills the
+banding 8-bit produces in dark gradients) in standard (limited-range bt709) color. For pixel-perfect
+colored filaments set `RECORD_PIXFMT = "yuv444p10le"` (full-chroma 4:4:4; plays in mpv/VLC).
 
 ---
 

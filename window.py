@@ -57,6 +57,16 @@ class Window:
         # Callback clavier additionnel optionnel (toggles B/M/C de main.py).
         # Signature attendue : fn(key, action). Installé via set_extra_key_callback.
         self._extra_key_callback = None
+        # Plein écran BORDERLESS (sans bordure, couvrant le moniteur ; bascule à
+        # chaud via toggle_fullscreen). On évite l'EXCLUSIF car, sous Windows,
+        # une appli OpenGL exclusive sans surface HDR force l'écran en SDR
+        # (« HDR désactivé ») ; le borderless laisse le compositeur DWM actif et
+        # conserve donc le mode HDR de l'écran.
+        self._is_fullscreen = bool(getattr(config, "fullscreen", False))
+        # Géométrie fenêtrée mémorisée pour revenir du plein écran.
+        self._windowed_pos = (80, 80)
+        self._windowed_size = (int(getattr(config, "width", 1280)),
+                               int(getattr(config, "height", 720)))
 
         # --- Initialisation GLFW -----------------------------------------
         if not glfw.init():
@@ -87,10 +97,20 @@ class Window:
 
         # --- Création de la fenêtre --------------------------------------
         if getattr(config, "fullscreen", False):
-            # Plein écran : on adopte directement la résolution native du
-            # moniteur (importante pour le rendu 4K/8K).
+            # Plein écran BORDERLESS (et non exclusif), DÉBORDANT de 1px hors écran
+            # sur chaque bord (taille +2, position -1) : la fenêtre n'est pas un
+            # calque exact du moniteur -> Windows ne la promeut pas en
+            # independent-flip (qui ferait retomber l'écran en SDR) -> DWM compose
+            # -> le HDR de l'écran est conservé. monitor=None -> pas d'exclusif.
+            glfw.window_hint(glfw.DECORATED, glfw.FALSE)
             w, h = self.monitor_size
-            self.handle = glfw.create_window(w, h, title, primary, None)
+            self.handle = glfw.create_window(w + 2, h + 2, title, None, None)
+            if self.handle:
+                try:
+                    mx, my = glfw.get_monitor_pos(primary)
+                    glfw.set_window_pos(self.handle, mx - 1, my - 1)
+                except Exception:
+                    pass
         else:
             # Fenêtré et redimensionnable (RESIZABLE par défaut sous GLFW).
             glfw.window_hint(glfw.RESIZABLE, glfw.TRUE)
@@ -166,6 +186,62 @@ class Window:
         pour désinstaller.
         """
         self._extra_key_callback = callback
+
+    # ------------------------------------------------------------------ #
+    #  Plein écran BORDERLESS (bascule à chaud)                          #
+    # ------------------------------------------------------------------ #
+    def toggle_fullscreen(self):
+        """Bascule entre fenêtré et PLEIN ÉCRAN BORDERLESS (fenêtre sans bordure
+        couvrant le moniteur primaire à sa résolution native). On n'utilise PAS
+        le plein écran exclusif : sous Windows, une appli OpenGL exclusive sans
+        surface HDR force l'écran en SDR (« HDR désactivé »). Le borderless
+        laisse le compositeur DWM actif -> le mode HDR de l'écran est conservé.
+        Mémorise la géométrie fenêtrée pour y revenir. Le changement de
+        framebuffer lève `resized` -> renderer/postfx se réajustent ensuite."""
+        if self.handle is None:
+            return
+        if self._is_fullscreen:
+            # Retour fenêtré : on redécore et on restaure la géométrie mémorisée.
+            glfw.set_window_attrib(self.handle, glfw.DECORATED, glfw.TRUE)
+            x, y = self._windowed_pos
+            w, h = self._windowed_size
+            glfw.set_window_monitor(self.handle, None, x, y, w, h, 0)
+            self._is_fullscreen = False
+        else:
+            # Mémorise la fenêtre courante, puis passe en borderless plein moniteur.
+            try:
+                self._windowed_pos = glfw.get_window_pos(self.handle)
+                self._windowed_size = glfw.get_window_size(self.handle)
+            except Exception:
+                pass
+            monitor = glfw.get_primary_monitor()
+            mode = glfw.get_video_mode(monitor)
+            try:
+                mx, my = glfw.get_monitor_pos(monitor)
+            except Exception:
+                mx, my = 0, 0
+            # DECORATED=FALSE + fenêtre (monitor=None) = borderless. MAIS on la
+            # fait DÉBORDER de 1px hors écran sur chaque bord (pos -1, taille +2) :
+            # ainsi elle n'est PAS un calque EXACT du moniteur, donc Windows ne la
+            # promeut pas en "fullscreen optimization"/independent-flip (qui ferait
+            # retomber l'écran en SDR comme l'exclusif). DWM continue de composer
+            # -> le mode HDR de l'écran est CONSERVÉ. Le débordement (+2 par
+            # dimension) garde aussi des tailles PAIRES (requis par l'encodage 4:2:0).
+            glfw.set_window_attrib(self.handle, glfw.DECORATED, glfw.FALSE)
+            glfw.set_window_monitor(self.handle, None, mx - 1, my - 1,
+                                    mode.size.width + 2, mode.size.height + 2, 0)
+            self._is_fullscreen = True
+        # Le changement peut réinitialiser le swap interval : on le réapplique.
+        glfw.swap_interval(1 if getattr(self.config, "vsync", True) else 0)
+        # Met à jour la taille du framebuffer + lève le drapeau de resize.
+        fb_w, fb_h = glfw.get_framebuffer_size(self.handle)
+        self._fb_size = (fb_w, fb_h)
+        self._resized = True
+
+    @property
+    def is_fullscreen(self):
+        """True si la fenêtre est actuellement en plein écran borderless."""
+        return self._is_fullscreen
 
     # ------------------------------------------------------------------ #
     #  Boucle / présentation                                              #

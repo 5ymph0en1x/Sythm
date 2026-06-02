@@ -41,6 +41,13 @@ soundcard>=0.4.3
 # --- Numérique --------------------------------------------------------------
 numpy>=1.24
 
+# --- Enregistrement (touche R) ----------------------------------------------
+# imageio-ffmpeg : fournit un binaire ffmpeg COMPLET, embarquant à la fois
+# l'encodeur LOGICIEL libx265 (qualité max, encodeur H.265 par défaut) ET
+# l'encodeur MATÉRIEL hevc_nvenc (GPU). -> enregistrement H.265 sans installer
+# ffmpeg sur le système, quel que soit RECORD_ENCODER ("x265" ou "nvenc").
+imageio-ffmpeg>=0.5
+
 # --- Optionnel --------------------------------------------------------------
 # pyrr : utilitaires de matrices/quaternions (caméra, projection). Le Renderer
 # peut fonctionner sans (matrices calculées à la main) ; décommentez si utilisé.
