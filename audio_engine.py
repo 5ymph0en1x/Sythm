@@ -20,9 +20,11 @@ CHAINE DE TRAITEMENT (vue d'ensemble) :
      n'attend jamais le rendu, et inversement).
   3. À chaque appel de get_features() (une fois par frame de rendu), on prend
      la dernière fenêtre `fft_size` du ring buffer, on la fenêtre (Hann) et on
-     calcule la FFT réelle SUR LE GPU avec CuPy (cupy.fft.rfft). Tout le DSP
-     lourd (magnitude, regroupement en bandes, spectre 512 bins, centroïde)
-     reste sur le GPU ; on ne rapatrie vers le CPU que ~10 scalaires.
+     calcule la FFT réelle EN CPU (numpy.fft.rfft) — quelques µs sur ~4096
+     points — puis on uploade la SEULE magnitude sur le GPU. Tout le reste du DSP
+     lourd (regroupement en bandes, spectre 512 bins, centroïde) reste sur le
+     GPU ; on ne rapatrie vers le CPU que ~10 scalaires. NB : la rfft est faite
+     en CPU pour NE PAS embarquer cuFFT (~284 Mo) dans le build standalone.
   4. Le SPECTRE 512 bins reste un tableau CuPy EN VRAM (`spectrum_gpu`) : le
      module de particules le lit directement device-to-device, sans aller-retour
      CPU. C'est le point clé de perf de tout le pipeline.
@@ -65,6 +67,7 @@ proprement (features à zéro) pour que le visualiseur tourne quand même.
 from __future__ import annotations
 
 import sys
+import math
 import time
 import threading
 from dataclasses import dataclass, field
@@ -132,6 +135,90 @@ class AudioFeatures:
     # source pour une reconstruction d'attracteur par plongement (cf. particles).
     waveform_gpu: "cp.ndarray | None" = None   # derniers fft_size échantillons bruts (GPU)
     samples_written: int = 0                   # total d'échantillons capturés (compteur)
+    # --- EXTENSIONS (non-cassantes) : ONSETS PERCUSSIFS PAR REGISTRE.
+    # Détection d'attaque séparée pour les trois grandes voix de la batterie, afin
+    # que chacune déclenche un GESTE visuel distinct (cf. particles : ondes de choc
+    # kick/snare/charley). Comme `beat`/`is_beat`, l'enveloppe décroît dans le temps
+    # et le booléen `*_hit` n'est vrai QUE sur la frame de déclenchement.
+    kick: float = 0.0          # onset GRAVE (sub/basses, ~20–150 Hz)   0..1, décroît
+    snare: float = 0.0         # onset MÉDIUM large (caisse/clap, ~150–2000 Hz)
+    hat: float = 0.0           # onset AIGU (charley/cymbales, ~2–16 kHz)
+    kick_hit: bool = False     # True sur la frame d'attaque grave
+    snare_hit: bool = False    # True sur la frame d'attaque médium
+    hat_hit: bool = False      # True sur la frame d'attaque aiguë
+    # --- EXTENSIONS (non-cassantes) : MODÈLE DE TEMPO / PHASE (entraînement au
+    # groove). Un oscillateur adaptatif s'accroche au pouls et PRÉDIT le temps
+    # fort -> permet l'ANTICIPATION (la nuée inspire avant le beat) et une houle
+    # caméra calée sur la mesure. S'efface seul (groove_conf->0) sur la musique
+    # sans pulsation nette. Mis à jour à CHAQUE frame (la phase avance en continu).
+    tempo_bpm: float = 0.0       # tempo estimé (battements/min ; 0 = pas verrouillé)
+    pulse_phase: float = 0.0     # phase du battement [0,1) (0 = sur le temps)
+    bar_phase: float = 0.0       # phase lente sur 4 temps [0,1) (« houle » de mesure)
+    groove_conf: float = 0.0     # confiance du verrouillage [0,1] (porte tout l'effet)
+    anticipation: float = 0.0    # [0,1] : monte AVANT le temps fort prédit (l'inspir)
+
+
+# ===========================================================================
+#  Détecteur d'ONSET générique (flux spectral half-wave + seuil adaptatif).
+# ===========================================================================
+class _OnsetDetector:
+    """Détecteur d'attaque sur UN signal d'énergie de bande (scalaire par frame).
+
+    Même principe que la détection de beat historique, mais factorisé pour être
+    instancié une fois PAR REGISTRE (grave / médium / aigu) avec ses propres
+    constantes — une charley n'a pas la même dynamique qu'un kick.
+
+    Principe :
+      * flux = hausse half-wave rectifiée de l'énergie depuis la frame précédente ;
+      * seuil ADAPTATIF = moyenne glissante + k·écart-type glissant du flux
+        (robuste quel que soit le niveau global) ;
+      * un franchissement déclenche une impulsion `env=1.0` qui décroît
+        géométriquement ; `hit` n'est vrai QUE sur la frame de déclenchement, avec
+        une période réfractaire pour éviter les doubles déclenchements.
+
+    Renvoie (env 0..1, hit bool) à chaque `update`.
+    """
+
+    __slots__ = ("_prev", "_avg", "_var", "_env", "_last_t",
+                 "refractory", "decay", "k", "_a")
+
+    def __init__(self, refractory=0.08, decay=0.85, k=1.6, smoothing=0.03):
+        self._prev = 0.0        # énergie de bande à la frame précédente
+        self._avg = 1e-6        # moyenne glissante du flux (seuil)
+        self._var = 1e-6        # variance glissante du flux
+        self._env = 0.0         # impulsion d'onset (décroît)
+        self._last_t = -1.0     # instant du dernier onset (anti-rebond)
+        self.refractory = float(refractory)
+        self.decay = float(decay)
+        self.k = float(k)
+        self._a = float(smoothing)   # vitesse d'adaptation des stats glissantes
+
+    def update(self, value: float, now: float) -> tuple[float, bool]:
+        flux = value - self._prev
+        if flux < 0.0:
+            flux = 0.0
+        self._prev = value
+        a = self._a
+        self._avg = (1.0 - a) * self._avg + a * flux
+        dev = flux - self._avg
+        self._var = (1.0 - a) * self._var + a * (dev * dev)
+        std = math.sqrt(self._var)
+        threshold = self._avg + self.k * std + 1e-6
+        hit = False
+        if flux > threshold and (now - self._last_t) > self.refractory:
+            self._env = 1.0
+            self._last_t = now
+            hit = True
+        else:
+            self._env *= self.decay
+        if self._env > 1.0:
+            self._env = 1.0
+        return self._env, hit
+
+    def decay_only(self) -> float:
+        """Cas silence : on fait juste décroître l'impulsion (aucun onset)."""
+        self._env *= self.decay
+        return self._env
 
 
 # ===========================================================================
@@ -333,18 +420,22 @@ class AudioEngine:
         self._mic = None
         self._is_loopback = False
         self._t0 = time.perf_counter()
+        # Dérivation OPTIONNELLE du flux audio BRUT pour l'enregistrement vidéo
+        # (cf. start_recording_tap). None tant qu'aucun enregistrement n'est en
+        # cours -> aucun impact sur le chemin get_features (contrat inchangé).
+        self._rec_q = None
 
         # ------------------------------------------------------------------ #
         #  Pré-calcul GPU : fenêtre de Hann + axe fréquentiel + matrices.    #
         # ------------------------------------------------------------------ #
         # Fenêtre de Hann sur fft_size points (réduit les fuites spectrales),
-        # pré-chargée en VRAM une fois pour toutes.
-        self._window = cp.asarray(
-            np.hanning(self.fft_size).astype(np.float32)
-        )
+        # gardée en CPU (numpy) : la rfft est calculée côté CPU dans
+        # _analyze_window (voir la note là-bas) pour NE PAS embarquer cuFFT
+        # (cufft64_*.dll, ~284 Mo) dans le build standalone.
+        self._window_cpu = np.hanning(self.fft_size).astype(np.float32)
         # Compensation de gain cohérente (somme de la fenêtre) pour des
         # magnitudes ~indépendantes de fft_size.
-        self._win_gain = float(np.sum(np.hanning(self.fft_size))) or 1.0
+        self._win_gain = float(np.sum(self._window_cpu)) or 1.0
 
         # Axe des fréquences de la rfft : fft_size points -> fft_size//2+1 bins.
         freqs_np = np.fft.rfftfreq(self.fft_size, d=1.0 / self.samplerate)
@@ -389,6 +480,25 @@ class AudioEngine:
         self._beat_decay = 0.86   # décroissance par frame de l'impulsion
         self._last_beat_t = -1.0  # anti-rebond : pas deux beats trop rapprochés
         self._beat_refractory = 0.10  # 100 ms mini entre deux onsets
+
+        # Onsets PERCUSSIFS par registre (kick/snare/charley) — un détecteur par
+        # voix, avec des constantes propres à sa dynamique. Le kick est lent et
+        # massif (réfractaire long, décroissance douce) ; la charley est vive et
+        # serrée (réfractaire court, décroissance rapide). Le snare écoute une
+        # bande médium LARGE (caisse claire/clap = transitoire à large spectre).
+        self._onset_kick = _OnsetDetector(refractory=0.11, decay=0.84, k=1.5)
+        self._onset_snare = _OnsetDetector(refractory=0.07, decay=0.80, k=1.7)
+        self._onset_hat = _OnsetDetector(refractory=0.045, decay=0.72, k=1.9)
+
+        # OSCILLATEUR DE TEMPO/PHASE (entraînement au groove, façon oscillateur
+        # adaptatif). Alimenté par les beats `is_beat` ; corrige doucement sa
+        # période et sa phase à chaque battement, et avance librement entre deux.
+        self._tempo_period = 0.5    # s par battement (120 BPM par défaut)
+        self._tempo_phase = 0.0     # phase courante [0,1)
+        self._tempo_conf = 0.0      # confiance de verrouillage [0,1]
+        self._tempo_last_t = 0.0    # horodatage du dernier update de phase
+        self._tempo_last_beat_t = -1.0  # dernier battement encaissé
+        self._bar_count = 0         # compteur de temps (0..3) -> phase de mesure
 
         # Cadence d'analyse : on évite de relancer une FFT plus souvent que
         # nécessaire (si get_features est appelé à 240 fps alors qu'un nouveau
@@ -543,6 +653,17 @@ class AudioEngine:
 
     def _push_block(self, block: np.ndarray) -> None:
         """Downmix mono + écriture dans le ring buffer (thread de capture)."""
+        # --- Dérivation enregistrement (AVANT downmix : on conserve les canaux
+        #     NATIFS, p.ex. stéréo). Non bloquant : si la file est pleine on
+        #     saute le bloc -> la capture (et donc get_features) n'est JAMAIS
+        #     ralentie par l'enregistrement.
+        q = self._rec_q
+        if q is not None:
+            try:
+                q.put_nowait(np.ascontiguousarray(block, dtype=np.float32))
+            except Exception:
+                pass
+
         # Downmix mono (moyenne des canaux) : énergie globale, et on évite de
         # garder plusieurs canaux dans le ring.
         if block.ndim == 2 and block.shape[1] > 1:
@@ -565,6 +686,26 @@ class AudioEngine:
                 self._ring[: n - first] = mono[first:]
             self._write_pos = end % self._ring_size
             self._frames_written += n
+
+    # ------------------------------------------------------------------ #
+    #  Dérivation d'enregistrement (audio BRUT pour le muxage vidéo).     #
+    #  AJOUT additif : n'affecte ni AudioFeatures ni get_features().      #
+    # ------------------------------------------------------------------ #
+    def start_recording_tap(self, maxsize: int = 256):
+        """Active une dérivation du flux audio BRUT (canaux NATIFS, au samplerate
+        de capture `self.samplerate`) et renvoie une `queue.Queue` thread-safe où
+        le thread de capture pousse une COPIE de chaque bloc. Le Recorder la
+        draine pour muxer une piste audio synchronisée. `stop_recording_tap()`
+        pour arrêter."""
+        import queue
+        q = queue.Queue(maxsize=int(max(8, maxsize)))
+        self._rec_q = q
+        return q
+
+    def stop_recording_tap(self) -> None:
+        """Désactive la dérivation (le thread de capture cesse d'alimenter la
+        file ; les blocs déjà présents restent drainables par le Recorder)."""
+        self._rec_q = None
 
     def _read_latest_window(self) -> tuple[np.ndarray | None, int]:
         """Lit les `fft_size` derniers échantillons du ring buffer.
@@ -598,7 +739,7 @@ class AudioEngine:
         Conçu pour être appelé à 120+ fps depuis la boucle de rendu :
           * si moins de `blocksize/2` nouveaux échantillons -> on réutilise le
             dernier résultat (zéro travail GPU) ;
-          * sinon -> une seule rfft GPU + quelques produits matriciels (< 2 ms
+          * sinon -> une seule rfft CPU + quelques produits matriciels GPU (< 2 ms
             sur une 4090).
 
         Si l'audio est indisponible / silencieux, renvoie des features nulles
@@ -613,6 +754,7 @@ class AudioEngine:
             with self._feat_lock:
                 feats = self._last_features
             feats.t = time.perf_counter() - self._t0
+            self._apply_tempo(feats, feats.t, False)   # phase continue (pas de beat frais)
             return feats
 
         # Anti-redondance : si aucun bloc neuf significatif depuis la dernière
@@ -622,6 +764,7 @@ class AudioEngine:
             with self._feat_lock:
                 feats = self._last_features
             feats.t = time.perf_counter() - self._t0
+            self._apply_tempo(feats, feats.t, False)   # phase continue (snapshot recyclé)
             return feats
         self._last_analyzed_frame = written
 
@@ -633,6 +776,8 @@ class AudioEngine:
         # reconstruire l'attracteur du son (device-to-device, pas de copie CPU).
         feats.waveform_gpu = cp.asarray(win, dtype=cp.float32)
         feats.samples_written = int(written)
+        # Oscillateur de tempo : corrige période/phase sur ce battement frais.
+        self._apply_tempo(feats, feats.t, bool(feats.is_beat))
         with self._feat_lock:
             self._last_features = feats
         return feats
@@ -650,17 +795,24 @@ class AudioEngine:
         if block_rms < 1e-5:
             return self._silent_features()
 
-        # --- Upload de la fenêtre sur le GPU (SEUL gros transfert CPU->GPU) ---
-        # fft_size floats (p.ex. 4096) -> quelques Ko, négligeable sur PCIe 4.0.
-        g_win = cp.asarray(win) * self._window
-
-        # --- FFT réelle + magnitude (sur GPU) ---
-        g_fft = cp.fft.rfft(g_win)                       # complexe (Nbins,)
-        g_mag = cp.abs(g_fft) * (2.0 / self._win_gain)   # magnitude normalisée
+        # --- FFT réelle + magnitude (CPU/numpy), PUIS upload de la magnitude ---
+        # La rfft d'une fenêtre de fft_size points (~4096) coûte quelques µs en
+        # CPU et évite d'embarquer cuFFT (cufft64_*.dll, ~284 Mo) dans le build
+        # standalone. On n'uploade QUE la magnitude (Nbins floats, quelques Ko) :
+        # le DSP lourd (réductions pondérées, spectre 512) reste sur GPU et
+        # `spectrum_gpu` est bien produit en VRAM — le contrat est inchangé.
+        win_w = win * self._window_cpu                   # fenêtrage Hann (CPU)
+        mag = np.abs(np.fft.rfft(win_w)).astype(np.float32)
+        mag *= np.float32(2.0 / self._win_gain)          # magnitude normalisée
+        g_mag = cp.asarray(mag)                          # (Nbins,) -> VRAM
         g_pow = g_mag * g_mag                            # puissance (pour bandes)
 
-        # --- Énergie RMS par bande : un produit matriciel (4 x Nbins) ---
-        g_band_rms = cp.sqrt(self._band_matrix @ g_pow + 1e-12)   # (4,)
+        # --- Énergie RMS par bande : somme pondérée (4 x Nbins) ---
+        # On évite l'opérateur @ (qui chargerait cuBLAS + cuBLASLt, ~500 Mo) :
+        # une multiplication DIFFUSÉE + réduction donne le même résultat via des
+        # kernels NVRTC, sur des matrices minuscules -> coût négligeable.
+        g_band_rms = cp.sqrt(
+            cp.sum(self._band_matrix * g_pow[None, :], axis=1) + 1e-12)   # (4,)
 
         # --- Centroïde spectral (barycentre des fréquences pondéré par mag) --
         # centroid_hz = sum(f * mag) / sum(mag). Reste sur GPU.
@@ -668,7 +820,9 @@ class AudioEngine:
         g_centroid_hz = cp.sum(self._freqs_gpu * g_mag) / mag_sum
 
         # --- Spectre downsamplé 512 bins (magnitude moyenne par bin log) ---
-        g_spec = self._spectrum_matrix @ g_mag           # (N_SPECTRUM,)
+        # Même raison qu'au-dessus : somme pondérée diffusée plutôt que @, pour
+        # NE PAS charger cuBLAS. (512 x Nbins) -> (N_SPECTRUM,), reste en VRAM.
+        g_spec = cp.sum(self._spectrum_matrix * g_mag[None, :], axis=1)
         # Échelle « musicale » : compression douce (racine) pour densifier le
         # bas niveau visuellement, sans le coût d'un log complet.
         g_spec = cp.sqrt(g_spec + 1e-12)
@@ -714,6 +868,15 @@ class AudioEngine:
         # --- Détection de beat (flux spectral bass+low_mid, seuil adaptatif) -
         beat_strength, is_beat = self._detect_beat(band_rms[:2])
 
+        # --- Onsets PERCUSSIFS par registre (sur les énergies de bande BRUTES) -
+        # kick = grave ; snare = médium LARGE (low_mid+mid, transitoire de caisse
+        # claire/clap) ; charley = aigu. Chacun alimente un geste visuel distinct.
+        now = time.perf_counter() - self._t0
+        kick_s, kick_h = self._onset_kick.update(float(band_rms[0]), now)
+        snare_s, snare_h = self._onset_snare.update(
+            float(band_rms[1] + band_rms[2]), now)
+        hat_s, hat_h = self._onset_hat.update(float(band_rms[3]), now)
+
         return AudioFeatures(
             bass=float(sm_bands[0]),
             low_mid=float(sm_bands[1]),
@@ -725,6 +888,8 @@ class AudioEngine:
             centroid=centroid_norm,
             spectrum_gpu=spectrum_gpu_frame,
             t=0.0,   # rempli par get_features()
+            kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
+            kick_hit=bool(kick_h), snare_hit=bool(snare_h), hat_hit=bool(hat_h),
         )
 
     # ------------------------------------------------------------------ #
@@ -794,6 +959,103 @@ class AudioEngine:
         return float(min(self._beat_env, 1.0)), is_beat
 
     # ------------------------------------------------------------------ #
+    #  Oscillateur de TEMPO/PHASE : entraînement au groove + anticipation.
+    #  Appelé à CHAQUE frame (même cache) pour que la phase avance en continu ;
+    #  ne corrige période/phase QUE sur un battement frais (`beat_now`).
+    # ------------------------------------------------------------------ #
+    def _apply_tempo(self, feats: "AudioFeatures", now: float, beat_now: bool) -> None:
+        # 1) Avance de la phase au temps réel écoulé depuis le dernier appel.
+        dt = now - self._tempo_last_t
+        self._tempo_last_t = now
+        if dt < 0.0:
+            dt = 0.0
+        elif dt > 0.5:
+            dt = 0.0   # gros trou (pause) -> on n'avance pas la phase d'un coup
+
+        period = self._tempo_period
+        self._tempo_phase += dt / max(period, 1e-3)
+        while self._tempo_phase >= 1.0:           # franchissement d'un temps prédit
+            self._tempo_phase -= 1.0
+            self._bar_count = (self._bar_count + 1) & 3   # 0..3 (mesure 4 temps)
+
+        # 2) Correction sur un battement FRAIS (oscillateur adaptatif).
+        if beat_now:
+            # Erreur de phase e ∈ (-0.5, 0.5] : 0 = le beat tombe pile sur phase=0.
+            e = self._tempo_phase
+            if e > 0.5:
+                e -= 1.0
+            ae = abs(e)
+            # --- PÉRIODE par intervalle inter-onset (robuste, repliement d'octave)
+            # L'écart depuis le dernier battement EST une observation de période
+            # (ou un multiple) : on le replie sur l'octave la plus proche de notre
+            # estimation, puis EMA -> verrouillage en quelques battements.
+            if self._tempo_last_beat_t >= 0.0:
+                ioi = now - self._tempo_last_beat_t
+                if ioi > 0.05:
+                    if self._tempo_conf > 0.40:
+                        # SUIVI : on a un verrou -> replie l'IOI sur l'octave la
+                        # plus proche du tempo connu (absorbe beats manqués/en trop).
+                        while ioi < 0.75 * period:
+                            ioi *= 2.0
+                        while ioi > 1.50 * period:
+                            ioi *= 0.5
+                        beta = 0.20
+                    else:
+                        # ACQUISITION : pas encore de verrou -> on FAIT CONFIANCE à
+                        # l'IOI brut (juste replié dans la bande [60,200] BPM) et on
+                        # converge vite, sans biais vers la période par défaut.
+                        while ioi < 0.30:
+                            ioi *= 2.0
+                        while ioi > 1.00:
+                            ioi *= 0.5
+                        beta = 0.50
+                    if 0.28 <= ioi <= 1.05:
+                        period = (1.0 - beta) * period + beta * ioi
+                        if period < 0.30:
+                            period = 0.30
+                        elif period > 1.00:
+                            period = 1.00
+                        self._tempo_period = period
+            # --- PHASE : tire fermement la phase vers le battement (alignement).
+            self._tempo_phase -= 0.40 * e
+            if self._tempo_phase < 0.0:
+                self._tempo_phase += 1.0
+            elif self._tempo_phase >= 1.0:
+                self._tempo_phase -= 1.0
+            # --- CONFIANCE : forte quand les battements tombent régulièrement où
+            # on les prédit (petite erreur de phase). EMA -> entraînement progressif.
+            target = 1.0 - 2.5 * ae
+            if target < 0.0:
+                target = 0.0
+            self._tempo_conf += 0.12 * (target - self._tempo_conf)
+            self._tempo_last_beat_t = now
+        else:
+            # Pas de battement : si le pouls s'est tu, on PERD le verrou peu à peu.
+            if (self._tempo_last_beat_t >= 0.0
+                    and (now - self._tempo_last_beat_t) > 2.0 * period):
+                self._tempo_conf -= dt * 0.35   # ~3 s pour tout relâcher
+                if self._tempo_conf < 0.0:
+                    self._tempo_conf = 0.0
+
+        # 3) Anticipation : tension qui MONTE sur le dernier tiers avant le temps
+        #    fort prédit (l'inspir), nulle ailleurs, portée par la confiance.
+        ph = self._tempo_phase
+        w = 0.33
+        if ph > (1.0 - w):
+            tension = (ph - (1.0 - w)) / w
+            tension *= tension                 # ease-in (douceur croissante)
+        else:
+            tension = 0.0
+
+        # 4) Publication dans le snapshot (lu par particules + caméra).
+        conf = self._tempo_conf
+        feats.tempo_bpm = float(60.0 / max(self._tempo_period, 1e-3)) if conf > 0.05 else 0.0
+        feats.pulse_phase = float(self._tempo_phase)
+        feats.bar_phase = float((self._bar_count + self._tempo_phase) * 0.25)
+        feats.groove_conf = float(conf)
+        feats.anticipation = float(tension * conf)
+
+    # ------------------------------------------------------------------ #
     #  Features « silence » : décroissance douce, spectrum_gpu valide.   #
     # ------------------------------------------------------------------ #
     def _silent_features(self) -> AudioFeatures:
@@ -812,6 +1074,11 @@ class AudioEngine:
         cp.clip(self._env_spectrum_gpu, 0.0, 1.0, out=self._spectrum_out_gpu)
         spectrum_gpu_frame = self._spectrum_out_gpu.copy()
 
+        # Onsets percussifs : simple décroissance (aucune attaque en silence).
+        kick_s = self._onset_kick.decay_only()
+        snare_s = self._onset_snare.decay_only()
+        hat_s = self._onset_hat.decay_only()
+
         return AudioFeatures(
             bass=float(self._env_bands[0]),
             low_mid=float(self._env_bands[1]),
@@ -823,6 +1090,8 @@ class AudioEngine:
             centroid=0.0,
             spectrum_gpu=spectrum_gpu_frame,
             t=0.0,   # rempli par get_features()
+            kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
+            kick_hit=False, snare_hit=False, hat_hit=False,
         )
 
 

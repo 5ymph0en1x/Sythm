@@ -145,6 +145,19 @@ class Window:
         glfw.set_key_callback(self.handle, self._on_key)
         glfw.set_framebuffer_size_callback(self.handle, self._on_framebuffer_size)
 
+        # --- Auto-masquage du curseur (confort de lecture en plein écran) -
+        # En plein écran, on masque le curseur après quelques secondes
+        # d'immobilité ; le moindre mouvement le fait réapparaître. En fenêtré,
+        # il reste toujours visible. Géré par _update_cursor_autohide(), appelé
+        # à chaque frame depuis poll_events().
+        self._cursor_hidden = False
+        self._cursor_idle_delay = 3.0          # s d'immobilité avant masquage
+        try:
+            self._last_cursor_pos = glfw.get_cursor_pos(self.handle)
+        except Exception:
+            self._last_cursor_pos = (0.0, 0.0)
+        self._last_motion_time = glfw.get_time()
+
     # ------------------------------------------------------------------ #
     #  Callbacks GLFW                                                     #
     # ------------------------------------------------------------------ #
@@ -237,6 +250,15 @@ class Window:
         fb_w, fb_h = glfw.get_framebuffer_size(self.handle)
         self._fb_size = (fb_w, fb_h)
         self._resized = True
+        # Curseur : on le rend visible et on réarme le délai d'inactivité (3 s de
+        # grâce après la bascule) ; en plein écran il se re-masquera tout seul si
+        # l'on ne bouge plus.
+        self._set_cursor_visible(True)
+        self._last_motion_time = glfw.get_time()
+        try:
+            self._last_cursor_pos = glfw.get_cursor_pos(self.handle)
+        except Exception:
+            pass
 
     @property
     def is_fullscreen(self):
@@ -244,11 +266,58 @@ class Window:
         return self._is_fullscreen
 
     # ------------------------------------------------------------------ #
+    #  Auto-masquage du curseur (confort de lecture)                     #
+    # ------------------------------------------------------------------ #
+    def _set_cursor_visible(self, visible):
+        """Affiche (CURSOR_NORMAL) ou masque (CURSOR_HIDDEN) le curseur. On reste
+        en mode HIDDEN (et non DISABLED) : la position continue d'être rapportée
+        normalement, donc un mouvement suffit à le faire réapparaître."""
+        if self.handle is None:
+            return
+        mode = glfw.CURSOR_NORMAL if visible else glfw.CURSOR_HIDDEN
+        try:
+            glfw.set_input_mode(self.handle, glfw.CURSOR, mode)
+        except Exception:
+            pass
+        self._cursor_hidden = not visible
+
+    def _update_cursor_autohide(self):
+        """Masque le curseur après `_cursor_idle_delay` s d'immobilité, UNIQUEMENT
+        en plein écran. Tout mouvement le réveille. En fenêtré, il reste visible.
+        Appelé à chaque frame depuis poll_events()."""
+        if self.handle is None:
+            return
+        # Hors plein écran : curseur toujours visible, jamais masqué.
+        if not self._is_fullscreen:
+            if self._cursor_hidden:
+                self._set_cursor_visible(True)
+            return
+        try:
+            x, y = glfw.get_cursor_pos(self.handle)
+        except Exception:
+            return
+        lx, ly = self._last_cursor_pos
+        now = glfw.get_time()
+        # Mouvement (au-delà d'un petit seuil anti-jitter) -> on réveille le curseur.
+        if abs(x - lx) > 0.5 or abs(y - ly) > 0.5:
+            self._last_cursor_pos = (x, y)
+            self._last_motion_time = now
+            if self._cursor_hidden:
+                self._set_cursor_visible(True)
+            return
+        # Immobile : on masque une fois le délai d'inactivité dépassé.
+        if (not self._cursor_hidden
+                and (now - self._last_motion_time) > self._cursor_idle_delay):
+            self._set_cursor_visible(False)
+
+    # ------------------------------------------------------------------ #
     #  Boucle / présentation                                              #
     # ------------------------------------------------------------------ #
     def poll_events(self):
-        """Traite la file d'événements GLFW (clavier, resize, fermeture)."""
+        """Traite la file d'événements GLFW (clavier, resize, fermeture) puis met
+        à jour l'auto-masquage du curseur (confort de lecture en plein écran)."""
         glfw.poll_events()
+        self._update_cursor_autohide()
 
     def swap_buffers(self):
         """Présente le framebuffer (échange avant/arrière)."""

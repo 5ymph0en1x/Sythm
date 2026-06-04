@@ -89,7 +89,7 @@ MAX_RENDER_PIXELS = 10_000_000_000
 
 # MSAA du framebuffer par défaut (présentation finale). Le rendu des particules,
 # lui, profite surtout du supersampling ; voir la note dans window.py.
-MSAA_SAMPLES = 4
+MSAA_SAMPLES = 2
 
 # vsync : True -> synchronisé au moniteur (pas de tearing). False -> FPS max.
 VSYNC = True
@@ -116,7 +116,7 @@ DENOISE_ITERS = 7             # nb de passes à-trous (+ = rayon large, + lisse)
 # ffmpeg fourni par imageio-ffmpeg (aucune install système). Fichier .mp4 écrit
 # dans RECORD_DIR, à cadence fixe. L'écriture se fait dans un thread dédié : la
 # boucle de rendu n'est jamais figée par l'encodeur.
-RECORD_ENCODER = "x265"        # "x265" = encodeur LOGICIEL (qualité MAX, + lent ; bien
+RECORD_ENCODER = "nvenc"       # "x265" = encodeur LOGICIEL (qualité MAX, + lent ; bien
                                #   meilleur sur notre contenu sombre/granuleux : préserve
                                #   le grain et les filaments au lieu de les lisser).
                                #   "nvenc" = encodeur MATÉRIEL GPU (temps réel garanti).
@@ -124,14 +124,17 @@ RECORD_FPS = 30                # images/s de la vidéo (pacing horloge -> timing
                                #   NB : le visuel n'avance qu'au rythme du RENDU ; au-delà,
                                #   les images sont DUPLIQUÉES.
 RECORD_DIR = "."               # dossier de sortie des enregistrements
-RECORD_QUALITY = 16            # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
+RECORD_QUALITY = 21            # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
                                #   x265 : ~18 = excellent, ~16 = quasi transparent.
-RECORD_PRESET = "faster"       # x265 : ultrafast..placebo (medium = bon équilibre ; si trop
+RECORD_PRESET = "p5"           # x265 : ultrafast..placebo (medium = bon équilibre ; si trop
                                #   de frames sont droppées, passe à "fast"/"faster").
                                #   nvenc : p1..p7 (p7 = meilleure qualité).
-RECORD_PIXFMT = "p010"  # 10 bits 4:2:0 (Main10, tue le banding). Autres :
+RECORD_PIXFMT = "p010le"       # 10 bits 4:2:0 (Main10, tue le banding)(yuv420p10le). Autres :
                                #   "yuv444p10le" = 4:4:4 (chroma pleine, filaments nets) ;
                                #   "yuv420p" = 8 bits (ancien comportement).
+RECORD_AUDIO_BITRATE = "192k"  # piste AUDIO AAC stéréo 48 kHz muxée dans la vidéo. C'est le son
+                               #   SYSTÈME capté en loopback (ce que tu entends), dérivé du moteur
+                               #   audio -> synchrone avec l'image. Mets "" (ou None) pour muet.
 
 
 # --- CAMÉRA ------------------------------------------------------------------
@@ -402,14 +405,29 @@ def main():
             if loop_state.toggle_record:
                 loop_state.toggle_record = False
                 if loop_state.recorder is None:
-                    # Dimensions du framebuffer FINAL réellement lu par le recorder.
-                    sw, sh = ctx.screen.size
+                    # Taille RÉELLE du framebuffer par défaut (= taille GLFW du
+                    # framebuffer). SURTOUT PAS ctx.screen.size : moderngl ne met
+                    # pas à jour la taille de l'écran au resize -> en plein écran
+                    # elle resterait à la taille fenêtrée initiale et la capture
+                    # ne prendrait qu'un coin de l'image.
+                    sw, sh = window.size
                     try:
+                        # Dérivation du flux audio loopback -> piste AAC muxée
+                        # (synchrone). RECORD_AUDIO_BITRATE vide -> vidéo muette.
+                        audio_q = (audio.start_recording_tap()
+                                   if (audio is not None and RECORD_AUDIO_BITRATE)
+                                   else None)
+                        a_rate = (getattr(audio, "samplerate", 48000)
+                                  if audio is not None else 48000)
                         loop_state.recorder = Recorder(
                             sw, sh, RECORD_FPS, RECORD_DIR, RECORD_ENCODER,
-                            RECORD_QUALITY, RECORD_PRESET, RECORD_PIXFMT)
+                            RECORD_QUALITY, RECORD_PRESET, RECORD_PIXFMT,
+                            audio_queue=audio_q, audio_rate=a_rate,
+                            audio_bitrate=RECORD_AUDIO_BITRATE)
+                        _atxt = (f", AAC {RECORD_AUDIO_BITRATE}" if audio_q
+                                 else ", muet")
                         print(f"[record] ● REC {sw}x{sh} {RECORD_ENCODER}/"
-                              f"{RECORD_PIXFMT} (HEVC q{RECORD_QUALITY}) -> "
+                              f"{RECORD_PIXFMT} (HEVC q{RECORD_QUALITY}{_atxt}) -> "
                               f"{loop_state.recorder.path}", file=sys.stderr)
                     except Exception as exc:
                         print(f"[record] démarrage impossible : {exc}", file=sys.stderr)
@@ -417,7 +435,9 @@ def main():
                 else:
                     rec = loop_state.recorder
                     loop_state.recorder = None
-                    path, nframes = rec.close()
+                    if audio is not None:
+                        audio.stop_recording_tap()   # stoppe la dérivation audio
+                    path, nframes = rec.close()      # draine le reste + muxe AAC
                     extra = (f", {rec.dropped} droppées"
                              if getattr(rec, "dropped", 0) else "")
                     print(f"[record] ■ sauvegardé : {path} "
@@ -455,7 +475,7 @@ def main():
 
             # --- 4b) Capture vidéo (si enregistrement actif), AVANT le swap ---
             if loop_state.recorder is not None:
-                loop_state.recorder.maybe_capture(ctx.screen)
+                loop_state.recorder.maybe_capture(ctx.screen, window.size)
 
             # --- 5) Présentation + événements + FPS --------------------------
             window.swap_buffers()

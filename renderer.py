@@ -357,6 +357,15 @@ class Renderer:
         # Recuperation defensive des features (None -> valeurs nulles).
         amp = float(getattr(features, "amplitude", 0.0)) if features is not None else 0.0
         beat = float(getattr(features, "beat", 0.0)) if features is not None else 0.0
+        # Modele de tempo/phase (groove) : lus defensivement -> 0 si absent ou pas
+        # encore verrouille. Ils transforment la reaction "tremblement par kick" en
+        # HOULE calee sur la mesure (cf. audio_engine._apply_tempo).
+        pulse_phase = float(getattr(features, "pulse_phase", 0.0)) if features is not None else 0.0
+        bar_phase = float(getattr(features, "bar_phase", 0.0)) if features is not None else 0.0
+        conf = float(getattr(features, "groove_conf", 0.0)) if features is not None else 0.0
+        two_pi = 2.0 * math.pi
+        houle = math.sin(two_pi * bar_phase)                    # -1..1 lent (4 temps)
+        pulse_peak = 0.5 + 0.5 * math.cos(two_pi * pulse_phase)  # 1 au temps, 0 au milieu
 
         # --- Angle d'orbite ---
         if self.camera_mode == "fixed":
@@ -367,22 +376,29 @@ class Renderer:
             angle = t * (2.0 * math.pi / 40.0)
             # Oscillation verticale tres douce de l'elevation.
             elev = 0.18 + 0.10 * math.sin(t * 0.13)
+            # HOULE verticale calee sur la MESURE (mode beat, portee par la confiance) :
+            # la camera "respire" lentement sur 4 temps au lieu de subir chaque kick.
+            if self.camera_mode == "beat":
+                elev += conf * 0.07 * houle
 
-        # --- Zoom & secousse reactifs (mode "beat" seulement) ---
+        # --- Zoom (amp) + HOCHEMENT de groove + secousse RESIDUELLE -----------
         # Lissage exponentiel pour eviter tout saut brutal entre deux frames.
+        groove_zoom = 0.0
         if self.camera_mode == "beat":
-            # Zoom : cible proportionnelle a l'amplitude (rapproche legerement
-            # quand ca joue fort). Amplitude d'effet volontairement faible.
-            zoom_target = 0.25 * min(amp, 1.5)
-            self._zoom_env += (zoom_target - self._zoom_env) * 0.08
-            # Secousse : impulsion sur le beat qui retombe vite.
-            self._shake_env = max(self._shake_env * 0.85, beat)
+            # Zoom doux pilote par l'amplitude (comme avant).
+            self._zoom_env += (0.25 * min(amp, 1.5) - self._zoom_env) * 0.08
+            # HOCHEMENT : la camera "pousse" doucement sur le temps fort. Pilote par
+            # la PHASE CONTINUE (pas un a-coup), d'autant plus marque que c'est cale.
+            groove_zoom = conf * 0.45 * pulse_peak
+            # Secousse : S'EFFACE a mesure que le groove se verrouille -> on remplace
+            # le tremblement-par-kick par le hochement lisse ci-dessus.
+            self._shake_env = max(self._shake_env * 0.85, beat * (1.0 - 0.8 * conf))
         else:
             self._zoom_env += (0.0 - self._zoom_env) * 0.08
             self._shake_env *= 0.85
 
-        # Distance camera : base - zoom (zoom positif => on se rapproche un peu).
-        dist = self._cam_base_dist - self._zoom_env
+        # Distance camera : base - zoom - hochement (positif => on se rapproche).
+        dist = self._cam_base_dist - self._zoom_env - groove_zoom
 
         # Position de l'oeil en orbite autour de l'origine.
         cx = math.cos(angle) * dist

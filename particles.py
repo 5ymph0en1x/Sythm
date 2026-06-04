@@ -105,6 +105,15 @@ __device__ void hsv2rgb(float h,float s,float v,float* rgb){
     rgb[0]=r;rgb[1]=g;rgb[2]=b;
 }
 
+// Échantillonnage interpolé du RELIEF TONAL (tableau 1D, u in [0,1] = rayon).
+__device__ __forceinline__ float relief_at(const float* relief, int nrel, float u){
+    if(u<0.0f)u=0.0f; if(u>1.0f)u=1.0f;
+    float fi=u*(float)(nrel-1);
+    int i0=(int)fi; if(i0<0)i0=0; if(i0>nrel-2)i0=nrel-2;
+    float fr=fi-(float)i0;
+    return relief[i0]*(1.0f-fr)+relief[i0+1]*fr;
+}
+
 // INIT origines : remplissage uniforme de la boîte [-L,L]^3.
 __global__ void init_field(float* pos, const int n, const float L, const unsigned int seed){
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
@@ -120,26 +129,35 @@ __global__ void init_field(float* pos, const int n, const float L, const unsigne
 //   richesse spatiale. Saturation dopée par le beat et les aigus.
 __device__ void spectral_color(
     float hue_id, float local, float t,
-    float bass, float mid, float high, float beat, float val, float* rgb)
+    float bass, float mid, float high, float beat, float centroid, float val, float* rgb)
 {
     float wsum = bass + mid + high + 0.02f;
     float spec = (mid * 0.33f + high * 0.66f) / wsum;   // 0 rouge, 0.33 vert, 0.66 bleu
     float hue = spec + (hue_id - 0.5f) * 0.30f + (local - 0.5f) * 0.20f + t * 0.01f;
+    // TEMPÉRATURE DE TEINTE par le CENTROÏDE spectral (brillance timbrale) : timbre
+    // brillant (centroid haut) -> teinte plus froide ; sourd (bas) -> plus chaude.
+    hue += (centroid - 0.5f) * 0.12f;
     float sat = fminf(0.97f, 0.75f + 0.20f * beat + 0.12f * high);
     hsv2rgb(hue, sat, val, rgb);
 }
 
-// UPDATE origines : advection champ ABC(Lorenz) + MÉMORISE la vitesse + écrit GL.
+// UPDATE origines : advection champ ABC(Lorenz) + ONDES DE CHOC + PAYSAGE TONAL
+//                   + MÉMORISE la vitesse (les traînées héritent du geste) + GL.
 __global__ void update_origin(
     float* pos, float* vel, float* gl_pos, float* gl_col,
     const int n, const float t, const float dt, const float L,
     const float lx, const float ly, const float lz,
     const float field_strength, const float k, const float turb_base,
     const float amp, const float beat, const float centroid,
-    const float bass, const float mid, const float high)
+    const float bass, const float mid, const float high,
+    const float* wpos, const float* wpar, const int n_waves,
+    const float* relief, const int nrel,
+    const float tonal_strength, const float tonal_cap, const float tonal_glow,
+    const float breath, const float accel_gain, const float accel_inv_scale)
 {
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
     float px=pos[i*3+0],py=pos[i*3+1],pz=pos[i*3+2];
+    float ovx=vel[i*3+0], ovy=vel[i*3+1], ovz=vel[i*3+2];   // vitesse frame n-1 (avant écrasement)
     float kx=px*k,ky=py*k,kz=pz*k;
     float fx=lx*sinf(kz)+lz*cosf(ky);
     float fy=ly*sinf(kx)+lx*cosf(kz);
@@ -153,6 +171,59 @@ __global__ void update_origin(
     float tvx=fx*spd + c[0]*turb;
     float tvy=fy*spd + c[1]*turb;
     float tvz=fz*spd + c[2]*turb;
+
+    // ----- ONDES DE CHOC PERCUSSIVES : coques sphériques qui TRAVERSENT -----
+    // Là où la coque gaussienne d'une onde passe (r ≈ vitesse·âge), on ajoute une
+    // POUSSÉE radiale (kick), un CISAILLEMENT tangentiel (snare) et un ÉCLAT
+    // (charley). Le rythme devient une météo qu'on VOIT voyager dans la matière.
+    float wave_bright=0.0f;
+    for(int w=0; w<n_waves; ++w){
+        float st=wpar[w*6+0];               // force (déjà fondue dans le temps)
+        if(st<1e-4f) continue;              // onde éteinte -> on saute
+        float ex=wpos[w*3+0], ey=wpos[w*3+1], ez=wpos[w*3+2];
+        float dx=px-ex, dy=py-ey, dz=pz-ez;
+        float r=sqrtf(dx*dx+dy*dy+dz*dz)+1e-4f;
+        float radius=wpar[w*6+1];           // rayon courant du front
+        float thick=wpar[w*6+2];
+        float s=(r-radius)/thick;
+        float shell=__expf(-s*s);           // coque gaussienne (1 sur le front)
+        float a=st*shell;
+        if(a<1e-4f) continue;
+        float inv=1.0f/r;
+        float nx=dx*inv, ny=dy*inv, nz=dz*inv;
+        float push=wpar[w*6+3];
+        float curl=wpar[w*6+4];
+        tvx+=nx*push*a; tvy+=ny*push*a; tvz+=nz*push*a;   // poussée radiale
+        if(curl!=0.0f){                     // tournoiement (cisaillement autour de Y)
+            float ttx=-nz, ttz=nx;          // = cross(n, up=(0,1,0)) horizontal
+            float tl=rsqrtf(ttx*ttx+ttz*ttz+1e-8f);
+            tvx+=ttx*tl*curl*a; tvz+=ttz*tl*curl*a;
+        }
+        wave_bright+=wpar[w*6+5]*a;         // éclat lumineux du front
+    }
+
+    // ----- PAYSAGE TONAL : relief radial stable (les notes TENUES le sculptent)
+    // On remonte DOUCEMENT le gradient du relief -> striations concentriques
+    // (graves au cœur, aigus en périphérie). Fenêtré + plafonné pour préserver le
+    // remplissage de l'espace ; l'advection continue de brasser -> jamais figé.
+    float prad=sqrtf(px*px+py*py+pz*pz)+1e-4f;
+    float ir=1.0f/prad;
+    float u=prad/L; if(u>1.0f)u=1.0f;
+    float tonal_here=relief_at(relief, nrel, u);
+    if(tonal_strength>0.0f){
+        float du=2.0f/(float)nrel;
+        float g=relief_at(relief,nrel,u+du)-relief_at(relief,nrel,u-du);
+        float win=u*(1.0f-u)*4.0f;          // 0 aux extrêmes, 1 au milieu
+        float tf=tonal_strength*g*win;
+        if(tf>tonal_cap)tf=tonal_cap; else if(tf<-tonal_cap)tf=-tonal_cap;
+        tvx+=px*ir*tf; tvy+=py*ir*tf; tvz+=pz*ir*tf;
+    }
+
+    // ----- RESPIRATION (pouls anticipé) : inspir AVANT le temps fort (vers le
+    // cœur), expir SUR le beat (vers l'extérieur). breath<0 -> converge, >0 ->
+    // s'épanouit. Transitoire et oscillant -> pas d'amas ; porté par le groove.
+    tvx+=px*ir*breath; tvy+=py*ir*breath; tvz+=pz*ir*breath;
+
     px+=tvx*dt; py+=tvy*dt; pz+=tvz*dt;
     float W=2.0f*L;
     if(px>L)px-=W; else if(px<-L)px+=W;
@@ -163,10 +234,17 @@ __global__ void update_origin(
     // couleur RICHE pilotée par les bandes de fréquences (cf. spectral_color).
     float vlen=sqrtf(tvx*tvx+tvy*tvy+tvz*tvz)+1e-4f;
     float local=tvz/vlen*0.5f+0.5f;
-    float val=fminf(0.50f+amp*0.25f+beat*0.30f+bass*0.30f, 1.15f);  // basses -> + lumineux
+    // basses -> + lumineux ; + ÉCLAT des fronts d'onde ; + LUEUR des strates tonales.
+    float val=0.50f+amp*0.25f+beat*0.30f+bass*0.30f
+              + wave_bright*0.6f + tonal_glow*tonal_here;
+    val=fminf(val, 1.5f);
     float rgb[3];
-    spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, val, rgb);
-    float brightness=0.55f;
+    spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, val, rgb);
+    // ÉTINCELLE DE CISAILLEMENT : |a| = Dv/Dt (différence finie vs vitesse n-1),
+    // compressée par tanh -> brille aux nœuds violents du flot ET au passage des fronts.
+    float ax=(tvx-ovx)/dt, ay=(tvy-ovy)/dt, az=(tvz-ovz)/dt;
+    float ahat=tanhf(sqrtf(ax*ax+ay*ay+az*az)*accel_inv_scale);
+    float brightness=0.55f + wave_bright*0.5f + accel_gain*ahat;   // fronts + nœuds de cisaillement
     gl_pos[i*4+0]=px; gl_pos[i*4+1]=py; gl_pos[i*4+2]=pz; gl_pos[i*4+3]=brightness;
     gl_col[i*4+0]=rgb[0]; gl_col[i*4+1]=rgb[1]; gl_col[i*4+2]=rgb[2]; gl_col[i*4+3]=1.0f;
 }
@@ -212,7 +290,7 @@ __global__ void update_emitted(
         float env = fin * fout;
         float vlen=sqrtf(vx*vx+vy*vy+vz*vz)+1e-4f;
         float local=vz/vlen*0.5f+0.5f;
-        spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, 0.75f, rgb);
+        spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, 0.75f, rgb);
         bright=emit_bright*env;                  // apparition + extinction douces
         alpha=1.0f;
     }
@@ -228,7 +306,6 @@ __global__ void update_emitted(
 #  Constantes (réglables à l'œil)
 # ===========================================================================
 _THREADS_PER_BLOCK = 256
-_SHAPE_MODES = {"sphere": 0, "cube": 1, "lorenz": 2, "murmuration": 3}
 
 _FIELD_STRENGTH = 0.9
 _WAVE = 1.2
@@ -240,6 +317,53 @@ _LZ_ZC = 25.0
 _LZ_NX, _LZ_NY, _LZ_NZ = 1.0/18.0, 1.0/24.0, 1.0/24.0
 _GUIDE_RATE = 3.0
 _GUIDE_HMAX = 0.01
+
+# --- ONDES DE CHOC PERCUSSIVES (kit-aware) -----------------------------------
+# Anneau de fronts sphériques qui TRAVERSENT la nuée à vitesse finie. Chaque
+# onset (kick/snare/charley) en engendre un, dont l'ÉPICENTRE est l'état courant
+# du Lorenz caché (jamais dessiné — il décide juste OÙ naît le rythme). Les
+# traînées héritent du geste car on perturbe la VITESSE des origines.
+_MAX_WAVES = 24                  # fronts simultanés (anneau ; le plus vieux est écrasé)
+# Table par registre : (vitesse, épaisseur, poussée_radiale, cisaillement, éclat, tau_s)
+#   kick    : lent, coque épaisse, forte poussée vers l'extérieur (souffle).
+#   snare   : vif, coque fine, poussée modérée + fort TOURNOIEMENT (cisaillement).
+#   charley : très rapide, coque ténue, peu de poussée mais SCINTILLE (éclat haut).
+_WAVE_KINDS = {
+    0: (5.5, 0.55, 2.2, 0.0, 0.55, 0.55),   # kick
+    1: (8.5, 0.28, 1.2, 1.9, 0.40, 0.38),   # snare
+    2: (12.0, 0.16, 0.45, 0.7, 0.75, 0.22),  # charley/hat
+}
+
+# --- PAYSAGE TONAL (relief radial sculpté par les notes TENUES) ---------------
+# Le spectre 512 (déjà en VRAM) est lissé LENTEMENT en un relief radial stable :
+# graves au cœur, aigus en périphérie. On remonte DOUCEMENT son gradient ->
+# striations concentriques (la forme vient de l'harmonie) que les ondes animent.
+# Couplage volontairement FAIBLE + PLAFONNÉ : on biaise la densité sans casser le
+# remplissage de l'espace (jamais d'effondrement en amas).
+_N_REL = 512                     # = AudioEngine.N_SPECTRUM
+_TONAL_STRENGTH = 0.7            # force du relief (0 = paysage tonal OFF)
+_TONAL_CAP = 1.3                 # plafond de la force radiale (anti-collapse)
+_TONAL_GLOW = 0.25               # lueur des strates énergétiques (les voir briller)
+_TONAL_TAU = 0.7                 # s — lissage du relief (grand = plus stable)
+
+# --- RESPIRATION (pouls anticipé) --------------------------------------------
+# La nuée INSPIRE (converge un peu vers le cœur) sur l'anticipation qui PRÉCÈDE
+# le temps fort, puis EXPIRE (s'épanouit vers l'extérieur) sur le beat. Geste
+# RADIAL transitoire et oscillant -> aucune accumulation nette (jamais d'amas) ;
+# porté par la confiance de groove (s'efface sur la musique sans pulsation nette).
+_BREATH_IN = 0.8                 # force de l'inspir (converge avant le temps fort)
+_BREATH_OUT = 1.5                # force de l'expir (s'épanouit sur le beat)
+
+# --- CINÉMATIQUE : ÉTINCELLE DE CISAILLEMENT (accélération matérielle) ---------
+# |a| = Dv/Dt (différence finie de la vitesse des ORIGINES, quasi gratuite : la
+# vitesse de la frame n-1 est encore dans vel[]) révèle où le flot change le plus
+# VIOLEMMENT — les nœuds du champ ABC ET le passage des fronts d'onde. Normalisée
+# par tanh (bornée) et AJOUTÉE à la luminosité PAR-PARTICULE (.w) -> scintillement
+# local aux nœuds, SANS toucher la respiration audio (qui vit dans `val`, pas dans
+# `.w`). Origines seules (les émises sont balistiques, a≈0). inv_scale calé sur la
+# distribution mesurée de |a| (p50≈39, p90≈106, fronts≈250+).
+_ACCEL_GAIN = 0.4                # intensité du scintillement (0 = OFF)
+_ACCEL_INV_SCALE = 0.005         # échelle tanh de |a| (~1/p99 : bulk discret, fronts saturent)
 
 
 # ===========================================================================
@@ -325,6 +449,9 @@ class ParticleSystem:
         self.n_total = self.n_origin + self.n_emit
         self.radius = float(radius)
         self.lifetime = float(lifetime)
+        # 'shape' est RÉSERVÉ : la nuée est toujours un remplissage de boîte advecté
+        # (cf. init_field) ; l'ancien sélecteur de forme (_SHAPE_MODES) a été retiré.
+        self.shape = shape
         self._gl_pos_buffer = gl_pos_buffer
         self._gl_col_buffer = gl_col_buffer
         self._nbytes = self.n_total * 4 * 4
@@ -348,6 +475,31 @@ class ParticleSystem:
         # Pool d'émises : (pos3, vel3, age1). age initial > lifetime -> invisibles.
         self.emit_state = cp.zeros(self.n_emit * 7, dtype=f32)
         self.emit_state.reshape(self.n_emit, 7)[:, 6] = self.lifetime + 1.0
+
+        # --- ONDES DE CHOC : anneau de fronts (état CPU minuscule + staging GPU) -
+        # On gère l'évolution temporelle (âge, fondu, rayon) sur CPU — 24 fronts,
+        # négligeable — puis on uploade deux petits tableaux par frame.
+        self._wave_pos = np.zeros((_MAX_WAVES, 3), dtype=np.float32)
+        self._wave_age = np.full(_MAX_WAVES, 1e9, dtype=np.float32)  # grand => éteinte
+        self._wave_str0 = np.zeros(_MAX_WAVES, dtype=np.float32)
+        self._wave_speed = np.zeros(_MAX_WAVES, dtype=np.float32)
+        self._wave_thick = np.ones(_MAX_WAVES, dtype=np.float32)
+        self._wave_push = np.zeros(_MAX_WAVES, dtype=np.float32)
+        self._wave_curl = np.zeros(_MAX_WAVES, dtype=np.float32)
+        self._wave_brt = np.zeros(_MAX_WAVES, dtype=np.float32)
+        self._wave_tau = np.ones(_MAX_WAVES, dtype=np.float32)
+        self._wave_head = 0
+        # Anti-doublon d'onset : l'instantané audio peut être RÉ-UTILISÉ sur
+        # plusieurs frames de rendu (ré-analyse tous les ~blocksize/2 échantillons).
+        # On ne déclenche les ondes que sur un instantané NEUF (samples_written a
+        # changé) -> un onset = un seul front, quel que soit le framerate.
+        self._last_samples = -1
+        self._wpar_cpu = np.zeros(_MAX_WAVES * 6, dtype=np.float32)  # staging CPU
+        self._wpos_gpu = cp.zeros(_MAX_WAVES * 3, dtype=f32)         # épicentres (VRAM)
+        self._wpar_gpu = cp.zeros(_MAX_WAVES * 6, dtype=f32)         # paramètres (VRAM)
+
+        # --- PAYSAGE TONAL : relief radial lissé, vit en VRAM (lu par le kernel) -
+        self._relief_gpu = cp.zeros(_N_REL, dtype=f32)
 
         self._block = (_THREADS_PER_BLOCK, 1, 1)
         self._grid_o = ((self.n_origin + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK, 1, 1)
@@ -422,11 +574,82 @@ class ParticleSystem:
         nsub = max(1, min(8, int(math.ceil(total/_GUIDE_HMAX))))
         h = total/nsub
         x, y, z = self._lx, self._ly, self._lz
+        # RK4 (scalaire, CPU) : robuste au pas — le pas est audio-variable, donc on
+        # veut une trajectoire quasi insensible au découpage, sans la dérive d'énergie
+        # qu'Euler explicite injecte sur Lorenz. Coût négligeable (1 appel/frame, ≤8 sous-pas).
+        def f(x, y, z):
+            return (_LZ_SIGMA*(y-x), x*(_LZ_RHO-z)-y, x*y-_LZ_BETA*z)
         for _ in range(nsub):
-            dx=_LZ_SIGMA*(y-x); dy=x*(_LZ_RHO-z)-y; dz=x*y-_LZ_BETA*z
-            x+=dx*h; y+=dy*h; z+=dz*h
+            k1 = f(x, y, z)
+            k2 = f(x+0.5*h*k1[0], y+0.5*h*k1[1], z+0.5*h*k1[2])
+            k3 = f(x+0.5*h*k2[0], y+0.5*h*k2[1], z+0.5*h*k2[2])
+            k4 = f(x+h*k3[0],     y+h*k3[1],     z+h*k3[2])
+            x += (h/6.0)*(k1[0]+2.0*k2[0]+2.0*k3[0]+k4[0])
+            y += (h/6.0)*(k1[1]+2.0*k2[1]+2.0*k3[1]+k4[1])
+            z += (h/6.0)*(k1[2]+2.0*k2[2]+2.0*k3[2]+k4[2])
         self._lx, self._ly, self._lz = x, y, z
         return (x*_LZ_NX, y*_LZ_NY, (z-_LZ_ZC)*_LZ_NZ)
+
+    # ----------------------------------------------- ondes de choc / relief tonal
+    def _spawn_wave(self, kind, strength, la, lb, lc):
+        """Allume un nouveau front (anneau : écrase le plus ancien). L'épicentre
+        est l'état du Lorenz CACHÉ (la,lb,lc, ~[-1,1]) projeté dans la boîte, avec
+        un léger décalage déterministe pour que les fronts ne naissent pas tous au
+        même point. `kind` : 0=kick, 1=snare, 2=charley."""
+        slot = self._wave_head
+        self._wave_head = (slot + 1) % _MAX_WAVES
+        L = self.radius
+        # Décalage déterministe (pas de RNG) variant avec le slot ET le temps.
+        b = slot * 1.7 + self._t * 3.1
+        jx = math.sin(b * 1.70) * 0.22 * L
+        jy = math.sin(b * 2.30 + 1.1) * 0.22 * L
+        jz = math.sin(b * 1.30 + 2.7) * 0.22 * L
+        self._wave_pos[slot, 0] = min(L, max(-L, la * L + jx))
+        self._wave_pos[slot, 1] = min(L, max(-L, lb * L + jy))
+        self._wave_pos[slot, 2] = min(L, max(-L, lc * L + jz))
+        self._wave_age[slot] = 0.0
+        # La force du front suit l'intensité de l'onset (bornée).
+        self._wave_str0[slot] = float(min(1.5, max(0.0, strength))) + 0.15
+        speed, thick, push, curl, brt, tau = _WAVE_KINDS.get(int(kind), _WAVE_KINDS[0])
+        self._wave_speed[slot] = speed
+        self._wave_thick[slot] = thick
+        self._wave_push[slot] = push
+        self._wave_curl[slot] = curl
+        self._wave_brt[slot] = brt
+        self._wave_tau[slot] = tau
+
+    def _advance_waves(self, dt):
+        """Fait vieillir les fronts (rayon = vitesse·âge ; fondu exp(-âge/tau)) et
+        prépare les deux petits tableaux GPU lus par le kernel. Un front qui a
+        quitté la boîte est éteint (force 0) -> le kernel le saute."""
+        self._wave_age += dt
+        radius = self._wave_speed * self._wave_age
+        fade = np.exp(-self._wave_age / np.maximum(self._wave_tau, 1e-3))
+        str_faded = self._wave_str0 * fade
+        # Au-delà de ~2.2·L le front a traversé toute la boîte -> on l'éteint.
+        str_faded[radius > (2.2 * self.radius)] = 0.0
+        par = self._wpar_cpu.reshape(_MAX_WAVES, 6)
+        par[:, 0] = str_faded
+        par[:, 1] = radius
+        par[:, 2] = self._wave_thick
+        par[:, 3] = self._wave_push
+        par[:, 4] = self._wave_curl
+        par[:, 5] = self._wave_brt
+        # Upload (minuscule : 24×6 + 24×3 floats).
+        self._wpar_gpu.set(self._wpar_cpu)
+        self._wpos_gpu.set(self._wave_pos.reshape(-1))
+
+    def _update_relief(self, dt, features):
+        """Lisse LENTEMENT le spectre 512 (déjà en VRAM) en un relief radial
+        stable. EMA de constante _TONAL_TAU : assez lent pour que seules les notes
+        TENUES sculptent le relief (le rythme, lui, l'ANIME via les ondes)."""
+        spec = getattr(features, "spectrum_gpu", None) if features is not None else None
+        if spec is not None and spec.shape[0] == _N_REL:
+            a = 1.0 - math.exp(-dt / _TONAL_TAU)
+            self._relief_gpu *= np.float32(1.0 - a)
+            self._relief_gpu += np.float32(a) * spec
+        else:
+            self._relief_gpu *= np.float32(0.98)   # plus de spectre -> s'efface
 
     # ------------------------------------------------------------- update
     def update(self, dt, features):
@@ -445,6 +668,24 @@ class ParticleSystem:
         self._centroid += 0.15*(target_centroid - self._centroid)
 
         la, lb, lc = self._advance_lorenz(dt, amp, beat, bass)
+
+        # --- ONDES DE CHOC : chaque onset (kick/snare/charley) engendre un front,
+        #     dont l'ÉPICENTRE est l'état courant du Lorenz CACHÉ (la,lb,lc). Le
+        #     contrat audio est lu défensivement (getattr) -> tourne même sans ces
+        #     champs (vieux moteur audio) ou sans audio du tout.
+        sw = getattr(features, "samples_written", None) if features is not None else None
+        fresh = (sw is None) or (sw != self._last_samples)  # instantané audio NEUF ?
+        self._last_samples = sw
+        if features is not None and fresh:
+            if getattr(features, "kick_hit", False):
+                self._spawn_wave(0, float(getattr(features, "kick", 0.0)), la, lb, lc)
+            if getattr(features, "snare_hit", False):
+                self._spawn_wave(1, float(getattr(features, "snare", 0.0)), la, lb, lc)
+            if getattr(features, "hat_hit", False):
+                self._spawn_wave(2, float(getattr(features, "hat", 0.0)), la, lb, lc)
+        self._advance_waves(dt)          # âge/fondu/rayon des fronts -> staging GPU
+        self._update_relief(dt, features)  # relief tonal lissé (EMA lente, en VRAM)
+
         k = _WAVE / max(self.radius, 1e-3) * math.pi
         # Taux d'émission = CAPACITÉ du ring (n_emit/lifetime). PAS de boost audio :
         # dépasser cette capacité recyclerait des particules ENCORE VISIBLES ->
@@ -454,8 +695,17 @@ class ParticleSystem:
         E = int(emit_per_sec * dt)
         E = max(0, min(E, self.n_emit))
 
+        # RESPIRATION : expir (vers l'extérieur) sur le beat, inspir (vers le cœur)
+        # sur l'anticipation. anticipation est DÉJÀ pondérée par la confiance côté
+        # audio ; on porte aussi l'expir par la confiance -> rien ne « pompe » sur
+        # une musique sans pulsation nette (groove_conf -> 0).
+        conf = float(getattr(features, "groove_conf", 0.0)) if features is not None else 0.0
+        antic = float(getattr(features, "anticipation", 0.0)) if features is not None else 0.0
+        breath = _BREATH_OUT * beat * conf - _BREATH_IN * antic
+
         self._cur = dict(dt=dt, la=la, lb=lb, lc=lc, k=k, amp=amp, beat=beat, E=E,
-                         head=self._emit_head, bass=bass, mid=mid, high=high)
+                         head=self._emit_head, bass=bass, mid=mid, high=high,
+                         breath=breath)
 
         if self._interop:
             self._update_interop()
@@ -476,7 +726,11 @@ class ParticleSystem:
                 f32(c["la"]), f32(c["lb"]), f32(c["lc"]),
                 f32(_FIELD_STRENGTH), f32(c["k"]), f32(_TURB_BASE),
                 f32(c["amp"]), f32(c["beat"]), f32(self._centroid),
-                f32(c["bass"]), f32(c["mid"]), f32(c["high"])))
+                f32(c["bass"]), f32(c["mid"]), f32(c["high"]),
+                self._wpos_gpu, self._wpar_gpu, i32(_MAX_WAVES),
+                self._relief_gpu, i32(_N_REL),
+                f32(_TONAL_STRENGTH), f32(_TONAL_CAP), f32(_TONAL_GLOW),
+                f32(c["breath"]), f32(_ACCEL_GAIN), f32(_ACCEL_INV_SCALE)))
             if c["E"] > 0:
                 g_emit = ((c["E"] + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK, 1, 1)
                 self._k_emit(g_emit, self._block, (
