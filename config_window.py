@@ -102,6 +102,11 @@ GROUPS = [
 MAIN_KEYS = [k for k in DEFAULTS if not k.startswith("_")]
 PARTICLE_KEYS = [k for k in DEFAULTS if k.startswith("_")]
 _KIND = {key: kind for _t0, _p, items in GROUPS for (key, _l, kind, _pp) in items}
+# Bornes (lo, hi, step) par clé numérique — pour CLAMPER read_values aux limites du
+# schéma. Sans ça, un sythm_config.json édité à la main peut injecter une valeur hors
+# bornes (p.ex. N_PARTICLES > limite d'index GL 32 bits) -> crash. Cf. read_values().
+_RANGE = {key: pp for _t0, _p, items in GROUPS
+          for (key, _l, kind, pp) in items if kind in ("int", "float")}
 
 # ---------------------------------------------------------------------------
 #  PRESETS VISUELS
@@ -592,9 +597,11 @@ def run_config(_test_build_only: bool = False):
                     if kind == "bool":
                         out[key] = bool(var.get())
                     elif kind == "int":
-                        out[key] = int(round(float(var.get())))
+                        lo, hi, _st = _RANGE[key]
+                        out[key] = max(int(lo), min(int(hi), int(round(float(var.get())))))
                     elif kind == "float":
-                        out[key] = float(var.get())
+                        lo, hi, _st = _RANGE[key]
+                        out[key] = max(float(lo), min(float(hi), float(var.get())))
                     elif key == "RECORD_AUDIO_BITRATE":
                         s = str(var.get())
                         out[key] = s if s in _BITRATES else ""   # tout sauf un débit = muet

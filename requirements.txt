@@ -28,6 +28,11 @@ glfw>=2.6
 #   - CUDA 13.x -> cupy-cuda13x  (par défaut ci-dessous ; machine de réf. RTX 4090)
 #   - CUDA 12.x -> remplacer par cupy-cuda12x
 cupy-cuda13x>=14.0
+# cuda-pathfinder + cffi : tirés par cupy 14.x / cuda-bindings pour localiser le
+# runtime CUDA (NVRTC/cudart) via CUDA_PATH, et par 'soundcard' (cffi). Normalement
+# transitifs, mais on les DÉCLARE car le build PyInstaller (Sythm.spec) en dépend.
+cuda-pathfinder>=1.0
+cffi>=1.16
 # pycuda : PLUS REQUIS. L'interop CUDA<->OpenGL se fait désormais en direct via
 # l'API DRIVER CUDA appelée en ctypes (cuGraphicsGLRegisterBuffer & co.), sans
 # PyCUDA — dont les wheels n'embarquent généralement pas le support GL. Laissé
@@ -47,6 +52,13 @@ numpy>=1.24
 # l'encodeur MATÉRIEL hevc_nvenc (GPU). -> enregistrement H.265 sans installer
 # ffmpeg sur le système, quel que soit RECORD_ENCODER ("x265" ou "nvenc").
 imageio-ffmpeg>=0.5
+
+# --- Interface de configuration (fenêtre au lancement) ----------------------
+# TKinterModernThemes : fenêtre de réglages thémée (thème « park », mode « dark »)
+# ouverte au démarrage (config_window.py), pour individualiser les settings sans
+# toucher au code. Repose sur tkinter (stdlib). Si la lib manque, Sythm démarre
+# quand même avec les valeurs par défaut (dégradation propre).
+TKinterModernThemes>=1.10
 
 # --- Optionnel --------------------------------------------------------------
 # pyrr : utilitaires de matrices/quaternions (caméra, projection). Le Renderer

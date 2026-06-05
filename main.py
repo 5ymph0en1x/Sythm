@@ -132,9 +132,11 @@ RECORD_FPS = _CFG["RECORD_FPS"]   # images/s de la vidéo (pacing horloge -> tim
 RECORD_DIR = "."               # dossier de sortie des enregistrements
 RECORD_QUALITY = _CFG["RECORD_QUALITY"]   # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
                                #   x265 : ~18 = excellent, ~16 = quasi transparent.
-RECORD_PRESET = "p5"           # x265 : ultrafast..placebo (medium = bon équilibre ; si trop
-                               #   de frames sont droppées, passe à "fast"/"faster").
-                               #   nvenc : p1..p7 (p7 = meilleure qualité).
+RECORD_PRESET = "p5"           # Preset de l'encodeur ACTIF. "p5" = preset NVENC (p1..p7,
+                               #   p7 = meilleure qualité) — cohérent avec RECORD_ENCODER
+                               #   = "nvenc" par défaut. En x265, un nom NVENC est remplacé
+                               #   par "medium" (cf. recorder.py) ; pour x265, mets un vrai
+                               #   preset : ultrafast..placebo.
 RECORD_PIXFMT = "p010le"       # 10 bits 4:2:0 (Main10, tue le banding)(yuv420p10le). Autres :
                                #   "yuv444p10le" = 4:4:4 (chroma pleine, filaments nets) ;
                                #   "yuv420p" = 8 bits (ancien comportement).
@@ -153,7 +155,9 @@ CAMERA_ROTATE_SPEED = _CFG["CAMERA_ROTATE_SPEED"]   # vitesse de rotation (rad/s
 
 # --- AUDIO -------------------------------------------------------------------
 AUDIO_SAMPLERATE = 48000       # Hz. Standard WASAPI/PulseAudio.
-FFT_SIZE = 1024                # taille de bloc / FFT (≈21 ms à 48 kHz). Puissance de 2.
+AUDIO_BLOCKSIZE = 1024         # taille de BLOC de capture audio (≈21 ms à 48 kHz). NB : ce
+                               #   n'est PAS la taille de FFT (fixée à 4096 dans audio_engine
+                               #   pour la résolution spectrale), juste la granularité de capture.
 
 # PALETTE COULEUR HDR éditable par l'utilisateur : liste de « stops » RGB.
 # Les valeurs peuvent dépasser 1.0 (HDR) pour des couleurs qui « brillent » et
@@ -268,7 +272,8 @@ def _max_total_particles(n_origin, render_w, render_h, msaa):
           On retire d'abord les framebuffers de rendu (HDR+MSAA+post-FX, fonction
           de la résolution) et une marge (pool cupy, fragmentation, headroom driver).
 
-    Renvoie un entier (>= n_origin tant que la carte peut tenir les origines)."""
+    Renvoie le plafond ABSOLU de n_total — qui PEUT être < n_origin si la carte ne
+    peut même pas tenir les seules origines : l'appelant clampe alors n_origin."""
     cap_int32 = (2**31 - 1 - 64 * 1024 * 1024) // 16            # ~130,1 M
 
     try:
@@ -289,7 +294,9 @@ def _max_total_particles(n_origin, render_w, render_h, msaa):
     # 60*n_total - 4*n_origin <= budget  ->  n_total <= (budget + 4*n_origin)/60
     cap_vram = (budget + 4 * n_origin) // 60
 
-    return int(max(n_origin, min(cap_int32, cap_vram)))
+    # MIN strict des deux limites — PAS de max(n_origin, …) : si n_origin lui-même
+    # dépasse, on DOIT pouvoir renvoyer < n_origin pour que l'appelant le clampe.
+    return int(max(1, min(cap_int32, cap_vram)))
 
 
 def main():
@@ -380,6 +387,10 @@ def main():
         _max_total = _max_total_particles(n_origin, render_w, render_h, MSAA_SAMPLES)
         if n_origin + n_emit > _max_total:
             _req = n_origin + n_emit
+            # On sacrifie d'abord les émises (traînées) ; si même les origines seules
+            # dépassent (N_PARTICLES hors bornes via un sythm_config.json édité à la
+            # main), on CLAMPE AUSSI n_origin -> jamais d'overflow d'index 32 bits/OOM.
+            n_origin = min(n_origin, _max_total)
             n_emit = max(0, _max_total - n_origin)
             print(f"[main] Particules plafonnées (matériel) : {_req:,} demandées -> "
                   f"{n_origin + n_emit:,} (VRAM libre + index 32 bits des buffers GL).",
@@ -448,7 +459,7 @@ def main():
         # =====================================================================
         #  5) AUDIO ENGINE  — démarre le thread de capture loopback + FFT GPU
         # =====================================================================
-        audio = AudioEngine(samplerate=AUDIO_SAMPLERATE, blocksize=FFT_SIZE)
+        audio = AudioEngine(samplerate=AUDIO_SAMPLERATE, blocksize=AUDIO_BLOCKSIZE)
         try:
             audio.start()
         except Exception as exc:

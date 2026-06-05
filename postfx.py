@@ -81,7 +81,7 @@ DEFAULT_BLOOM_INTENSITY = 0.6     # gain du bloom lors de la recomposition
 
 DEFAULT_MOTION_BLUR_STRENGTH = 0.7  # force de la trainee temporelle [0,1[
 
-DEFAULT_VIGNETTE_STRENGTH = 0.35  # intensite de la vignette (0 = desactivee)
+DEFAULT_VIGNETTE_STRENGTH = 0.25  # assombrissement des coins, 0..1 (0 = desactivee ; reste subtil)
 
 # Debruitage a-trous (lisse le speckle des particules eparses).
 DEFAULT_DENOISE_SIGMA = 1.0       # force (edge-stopping luminance) ; + grand = + lisse

@@ -135,8 +135,33 @@ class Window:
         self._fb_size = (fb_w, fb_h)
 
         # --- Contexte moderngl par-dessus le contexte GLFW courant -------
-        # require=460 -> OpenGL 4.6 ; moderngl récupère le contexte existant.
-        self.ctx = moderngl.create_context(require=460)
+        # OpenGL 4.6 requis. On crée le contexte SANS `require=` puis on vérifie la
+        # version nous-mêmes : sur un GPU/pilote sans 4.6 (iGPU, bureau distant, VM,
+        # pilote ancien), `require=460` lèverait une erreur OPAQUE et — pire —
+        # laisserait GLFW initialisé + la fenêtre créée (FUITE : cette Window à demi
+        # construite n'atteint jamais close()). On nettoie alors et on explique.
+        try:
+            self.ctx = moderngl.create_context()
+        except Exception as exc:
+            if self.handle:
+                glfw.destroy_window(self.handle)
+            glfw.terminate()
+            raise RuntimeError(
+                f"Impossible de créer un contexte OpenGL : {exc}. Sythm requiert un "
+                f"GPU + pilote OpenGL 4.6 (carte NVIDIA récente).") from exc
+        if self.ctx.version_code < 460:
+            _ver = self.ctx.info.get("GL_VERSION", f"version_code={self.ctx.version_code}")
+            try:
+                self.ctx.release()
+            except Exception:
+                pass
+            if self.handle:
+                glfw.destroy_window(self.handle)
+            glfw.terminate()
+            raise RuntimeError(
+                f"OpenGL 4.6 requis, mais le pilote n'expose que « {_ver} ». Sythm a "
+                f"besoin d'un GPU + pilote supportant OpenGL 4.6 ; les iGPU, sessions "
+                f"distantes (RDP) et machines virtuelles ne le fournissent souvent pas.")
         # Activation du point sprite programmable : nécessaire pour pouvoir
         # piloter gl_PointSize depuis le vertex shader (cf. renderer.py).
         # Sous core profile 4.6 c'est implicite, mais on garde l'intention claire.

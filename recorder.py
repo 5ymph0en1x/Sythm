@@ -153,24 +153,27 @@ class Recorder:
         if self.encoder == "nvenc":
             p = preset if preset in _NVENC_PRESETS else "p7"
             self.profile = _hevc_profile_for(str(pix_fmt))
+            # -multipass : override explicite si fourni (≠ "0"), sinon "fullres".
+            mp = str(nvenc_multipass) if (nvenc_multipass and str(nvenc_multipass) != "0") else "fullres"
+            # CHAQUE flag UNE seule fois (avant : -multipass/-pix_fmt/-profile:v étaient
+            # dupliqués -> « last wins »). -profile:v vient de self.profile (main10 en
+            # 4:2:0/4:2:2 10 bits, main444-10 en 4:4:4) — surtout PAS "main10" en dur,
+            # qui serait FAUX pour du 4:4:4.
             enc = [
                 "-c:v", "hevc_nvenc",
                 "-preset", str(p),
                 "-tune", "hq",
                 "-rc", "constqp", "-qp", str(quality),    # quality=18 par défaut
                 "-rc-lookahead", "32",
-                "-multipass", "fullres",
                 "-spatial-aq", "1",
                 "-temporal-aq", "1",
-                "-aq-strength", "10",                     # ou 10 si vous préférez
+                "-aq-strength", "10",
                 "-b_ref_mode", "1",
                 "-bf", "4",
-                "-profile:v", "main10",
+                "-multipass", mp,
                 "-pix_fmt", str(pix_fmt),
+                "-profile:v", self.profile,
             ]
-            if nvenc_multipass and str(nvenc_multipass) != "0":
-                enc += ["-multipass", str(nvenc_multipass)]
-            enc += ["-pix_fmt", str(pix_fmt), "-profile:v", self.profile]
         else:
             p = preset if preset in _X265_PRESETS else "medium"
             self.profile = None  # x265 déduit le profil du pix_fmt

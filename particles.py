@@ -777,7 +777,8 @@ class ParticleSystem:
         else:
             self._update_fallback()
 
-        self._emit_head = (self._emit_head + E) % self.n_emit
+        if self.n_emit:                  # EMIT_RATE=0 -> aucune émise -> pas de modulo par 0
+            self._emit_head = (self._emit_head + E) % self.n_emit
 
     def _launch(self, gl_pos, gl_col):
         """Lance les 3 kernels (origines -> émission -> émises) qui écrivent dans
@@ -802,12 +803,13 @@ class ParticleSystem:
                 self._k_emit(g_emit, self._block, (
                     self.pos_state, self.vel_state, self.emit_state,
                     i32(c["E"]), i32(self.n_origin), i32(self.n_emit), i32(c["head"])))
-            self._k_emitted(self._grid_e, self._block, (
-                self.emit_state, gl_pos, gl_col,
-                i32(self.n_emit), i32(self.n_origin), f32(c["dt"]),
-                f32(self.lifetime), f32(_EMIT_BRIGHT), f32(self._centroid),
-                f32(self._t), f32(c["bass"]), f32(c["mid"]), f32(c["high"]), f32(c["beat"]),
-                f32(c["harm_hue"])))
+            if self.n_emit > 0:          # grille _grid_e=(0,..) = lancement CUDA invalide
+                self._k_emitted(self._grid_e, self._block, (
+                    self.emit_state, gl_pos, gl_col,
+                    i32(self.n_emit), i32(self.n_origin), f32(c["dt"]),
+                    f32(self.lifetime), f32(_EMIT_BRIGHT), f32(self._centroid),
+                    f32(self._t), f32(c["bass"]), f32(c["mid"]), f32(c["high"]), f32(c["beat"]),
+                    f32(c["harm_hue"])))
 
     def _update_interop(self):
         arr = self._res_array
