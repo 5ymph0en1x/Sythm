@@ -1,6 +1,6 @@
 # Sythm
 
-<video src="sythm_sample.mp4" controls="controls" width="100%">
+<video src="[sythm_sample.mp4](https://github.com/5ymph0en1x/Sythm/raw/refs/heads/main/sythm_sample.mp4)" type="video/mp4">
 </video>
 
 **Real-time, audio-reactive 3D particle visualizer** — Python + GLSL, built for an **RTX 4090**.
