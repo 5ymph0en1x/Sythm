@@ -1,9 +1,5 @@
 # Sythm
 
-<p align="center">
-  <img src="pic.png" width="75%" alt="sample"/>
-</p>
-
 **Real-time, audio-reactive 3D particle visualizer** — Python + GLSL, built for an **RTX 4090**.
 
 Sythm captures, in *loopback*, the sound coming out of your speakers (Spotify, YouTube, a game…),
@@ -39,6 +35,7 @@ The program is split into independent slices, wired together by `main.py`:
 | `renderer.py`     | OpenGL 4.6 (moderngl): a single `GL_POINTS` draw call, additive gaussian sprites into an HDR (RGBA16F) framebuffer, perspective camera. |
 | `postfx.py`       | Fullscreen post-processing: **à-trous edge-aware denoise**, separable bloom, history-buffer motion blur, ACES/Uncharted2 tone mapping, Lanczos downscale. |
 | `window.py`       | GLFW window + OpenGL 4.6 core context, vsync, keyboard, resize. |
+| `config_window.py`| **Launch-time settings window** (themed Tk via `TKinterModernThemes`): ~30+ options across six groups, **five UI languages** (EN/DE/FR/IT/ES) and one-click **presets**. Holds `DEFAULTS` — the **single source of truth** for every tunable (`main.py`/`particles.py` read from it) — and persists choices to `sythm_config.json`. |
 
 **Per-frame flow** (`main.py`):
 `audio.get_features()` → `particles.update(dt, features)` → `renderer.render()` (HDR texture)
@@ -52,7 +49,8 @@ simulation writes straight into the OpenGL VBOs through **zero-copy CUDA interop
 
 ## Requirements
 
-- **NVIDIA GPU** (tuned for an RTX 4090; works on other RTX cards with a lower `N_PARTICLES`).
+- **NVIDIA GPU** (tuned for an RTX 4090; runs on other RTX cards too — the particle count
+  **auto-caps to your VRAM**, see *Configuration window*).
 - **Recent NVIDIA driver + CUDA Toolkit 13.x.**
   ⚠️ The CuPy wheel must match the toolkit: **`cupy-cuda13x`** for CUDA 13.x (use `cupy-cuda12x`
   if you are still on CUDA 12.x). See *Troubleshooting* below.
@@ -84,6 +82,10 @@ uv run python main.py
 # or
 python main.py
 ```
+
+On launch, a **settings window opens first** (themed, five languages, presets) — adjust
+anything and click **Launch**; your choices are saved to `sythm_config.json` for next time,
+and closing the window cancels the launch. See *Configuration window* below.
 
 Play some music on your default output and enjoy.
 
@@ -127,17 +129,39 @@ colored filaments set `RECORD_PIXFMT = "yuv444p10le"` (full-chroma 4:4:4; plays 
 
 ---
 
+## Configuration window
+
+Launching Sythm opens a **settings window first** (themed, dark) — adjust, then **Launch**:
+
+- **~30+ settings** across six groups: **Cloud**, **Window & rendering**, **Post-FX**,
+  **Rhythm & flow**, **Color & harmony**, **Camera & capture**.
+- **Five UI languages** — English, Deutsch, Français, Italiano, Español — switch live from the
+  dropdown (top-right); the choice is remembered.
+- **Presets** — one click for a whole look: *Ambient · Minimal · Energetic · Cosmic · Percussive*.
+- Choices persist to **`sythm_config.json`** (beside the executable, or the working dir when run
+  from source) and reload next time. Closing the window cancels the launch.
+
+`config_window.DEFAULTS` is the **single source of truth** for every tunable — `main.py` and
+`particles.py` read their constants from it — so there's exactly one place to change a factory default.
+
+---
+
 ## Tuning
 
-**Everything is at the top of `main.py`** (the tunable-parameter header), the only place you need
-to touch. Main knobs:
+Tune from the **configuration window** above (no code, no rebuild), or edit the factory defaults
+in **`config_window.DEFAULTS`**. Main knobs:
 
 - `N_PARTICLES` — number of **origin** particles. Total ≈ `N_PARTICLES × (1 + EMIT_RATE × EMITTED_LIFETIME)`.
+  The total is **automatically capped** to what your GPU can hold — free VRAM **and** the 32-bit GL
+  buffer limit (≈ 134 M points) — so a heavy preset won't crash a smaller card; it just renders fewer
+  points (the cap is logged to stderr).
 - `EMIT_RATE` / `EMITTED_LIFETIME` — emission rate and trail lifetime (drive the total count and trail length).
 - `PARTICLE_SIZE` — apparent particle size in pixels (smaller = fine grain, each particle distinct).
 - `CLOUD_RADIUS` — half-size of the particle box (the filled visible space).
 - `EXPOSURE` — global brightness. **Important:** additive accumulation scales with the particle
   count, so **lower the exposure as you raise the count** (≈ 0.6 at 5M, ≈ 0.15 at 35M+).
+  Brightness is now **resolution-independent**: exposure is auto-scaled to the render resolution
+  (calibrated at 720p), so the same value looks equally bright at 1080p / 1440p / 4K and in fullscreen.
 - `ENABLE_DENOISE` / `DENOISE_SIGMA` / `DENOISE_ITERS` — à-trous denoiser (lower sigma keeps more detail).
 - `ENABLE_BLOOM`, `ENABLE_MOTION_BLUR`, `BLOOM_INTENSITY`, `BLOOM_THRESHOLD` — cinematic look.
 - `CAMERA_MODE`, `FULLSCREEN`, `WINDOW_W/H`, `SUPERSAMPLE_FACTOR`, `VSYNC`.
