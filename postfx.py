@@ -67,6 +67,13 @@ except Exception:  # pragma: no cover - moderngl absent en CI pure
 #  surcharger a la volee via PostProcessor.set_params(**kwargs).
 # =============================================================================
 DEFAULT_EXPOSURE = 1.0            # exposition lineaire avant tonemap (1 = neutre)
+# Résolution de RÉFÉRENCE pour calibrer l'exposition. En blending additif avec une
+# taille de point CONSTANTE en pixels, la luminosité d'un pixel ∝ recouvrement de
+# sprites ∝ 1/(pixels de rendu) : la MÊME scène est plus sombre à plus haute
+# résolution. On met donc l'exposition à l'échelle ∝ pixels de rendu, calibrée sur
+# 1280×720 (fenêtre par défaut) -> un réglage EXPOSURE donné rend la MÊME luminosité
+# quelle que soit la résolution / le supersampling. cf. _effective_exposure().
+_EXPOSURE_REF_PIXELS = 1280 * 720
 
 DEFAULT_BLOOM_THRESHOLD = 1.0     # seuil de luminance du bright-pass (HDR)
 DEFAULT_BLOOM_KNEE = 0.5          # largeur du genou doux (soft knee) du seuil
@@ -320,6 +327,21 @@ class PostProcessor:
             self.denoise_iters = max(1, int(kwargs["denoise_iters"]))
 
     # ------------------------------------------------------------------ #
+    #  Exposition corrigee de la resolution                               #
+    # ------------------------------------------------------------------ #
+    def _effective_exposure(self):
+        """Exposition CORRIGEE DE LA RESOLUTION. En blending additif avec une taille
+        de point CONSTANTE (en pixels), la luminosite d'un pixel vient du RECOUVREMENT
+        de sprites et vaut ~ N*S^2/(pixels de rendu) -> elle decroit en 1/(pixels de
+        rendu) : la MEME scene est plus sombre a plus haute resolution. Pour qu'un
+        reglage EXPOSURE donne rende la MEME luminosite a toute resolution (et tout
+        supersampling, le downscale moyennant et preservant la moyenne), on met
+        l'exposition a l'echelle proportionnellement aux pixels de rendu, calibree sur
+        _EXPOSURE_REF_PIXELS (1280x720). A la resolution de reference -> facteur 1."""
+        px = max(1, self.render_width * self.render_height)
+        return self.exposure * (px / _EXPOSURE_REF_PIXELS)
+
+    # ------------------------------------------------------------------ #
     #  Redimensionnement                                                  #
     # ------------------------------------------------------------------ #
     def resize(self, render_width, render_height, screen_width, screen_height):
@@ -531,7 +553,7 @@ class PostProcessor:
         prog = self._programs["composite"]
         scene_tex.use(location=0)
         prog["u_scene"].value = 0
-        prog["u_exposure"].value = self.exposure
+        prog["u_exposure"].value = self._effective_exposure()   # corrigee de la resolution
         prog["u_tonemap_mode"].value = self.tonemap_mode
         prog["u_enable_bloom"].value = 1 if (self.enable_bloom and
                                              bloom_tex is not None) else 0

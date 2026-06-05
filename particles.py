@@ -56,6 +56,10 @@ except Exception:
     cp = None                                # type: ignore
     _HAS_CUPY = False
 
+# Valeurs de paramétrage : LUES depuis la fenêtre de config (source de vérité
+# unique). Les constantes _* exposées plus bas ne codent plus de valeur en dur.
+from config_window import DEFAULTS as _CFG
+
 _CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD = 0x02
 
 
@@ -129,7 +133,7 @@ __global__ void init_field(float* pos, const int n, const float L, const unsigne
 //   richesse spatiale. Saturation dopée par le beat et les aigus.
 __device__ void spectral_color(
     float hue_id, float local, float t,
-    float bass, float mid, float high, float beat, float centroid, float val, float* rgb)
+    float bass, float mid, float high, float beat, float centroid, float harm_hue, float val, float* rgb)
 {
     float wsum = bass + mid + high + 0.02f;
     float spec = (mid * 0.33f + high * 0.66f) / wsum;   // 0 rouge, 0.33 vert, 0.66 bleu
@@ -137,6 +141,7 @@ __device__ void spectral_color(
     // TEMPÉRATURE DE TEINTE par le CENTROÏDE spectral (brillance timbrale) : timbre
     // brillant (centroid haut) -> teinte plus froide ; sourd (bas) -> plus chaude.
     hue += (centroid - 0.5f) * 0.12f;
+    hue += harm_hue;            // HARMONIE : modalité (chaud/froid) + teinte-maison de tonalité
     float sat = fminf(0.97f, 0.75f + 0.20f * beat + 0.12f * high);
     hsv2rgb(hue, sat, val, rgb);
 }
@@ -153,7 +158,8 @@ __global__ void update_origin(
     const float* wpos, const float* wpar, const int n_waves,
     const float* relief, const int nrel,
     const float tonal_strength, const float tonal_cap, const float tonal_glow,
-    const float breath, const float accel_gain, const float accel_inv_scale)
+    const float breath, const float accel_gain, const float accel_inv_scale,
+    const float build, const float drop, const float harm_hue)
 {
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n) return;
     float px=pos[i*3+0],py=pos[i*3+1],pz=pos[i*3+2];
@@ -163,7 +169,7 @@ __global__ void update_origin(
     float fy=ly*sinf(kx)+lx*cosf(kz);
     float fz=lz*sinf(ky)+ly*cosf(kx);
     // MOUVEMENT calé sur les BASSES : les graves accélèrent le flux + la turbulence.
-    float spd=field_strength*(1.0f+0.5f*amp+2.0f*bass);
+    float spd=field_strength*(1.0f+0.5f*amp+2.0f*bass)*(1.0f+0.8f*build);  // le build accélère le flux
     float c[3]; float ns=0.6f;
     curl_noise(px*ns+t*0.2f, py*ns, pz*ns-t*0.2f, c);
     float turb=turb_base*(1.0f+4.0f*beat+2.5f*bass);
@@ -237,14 +243,15 @@ __global__ void update_origin(
     // basses -> + lumineux ; + ÉCLAT des fronts d'onde ; + LUEUR des strates tonales.
     float val=0.50f+amp*0.25f+beat*0.30f+bass*0.30f
               + wave_bright*0.6f + tonal_glow*tonal_here;
-    val=fminf(val, 1.5f);
+    val=val*(1.0f-0.35f*build) + 0.80f*drop;   // build ASSOMBRIT (charge), drop FLASHE
+    val=fminf(val, 1.6f);
     float rgb[3];
-    spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, val, rgb);
+    spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, harm_hue, val, rgb);
     // ÉTINCELLE DE CISAILLEMENT : |a| = Dv/Dt (différence finie vs vitesse n-1),
     // compressée par tanh -> brille aux nœuds violents du flot ET au passage des fronts.
     float ax=(tvx-ovx)/dt, ay=(tvy-ovy)/dt, az=(tvz-ovz)/dt;
     float ahat=tanhf(sqrtf(ax*ax+ay*ay+az*az)*accel_inv_scale);
-    float brightness=0.55f + wave_bright*0.5f + accel_gain*ahat;   // fronts + nœuds de cisaillement
+    float brightness=0.55f + wave_bright*0.5f + accel_gain*ahat + 0.60f*drop;   // fronts + cisaillement + FLASH du drop
     gl_pos[i*4+0]=px; gl_pos[i*4+1]=py; gl_pos[i*4+2]=pz; gl_pos[i*4+3]=brightness;
     gl_col[i*4+0]=rgb[0]; gl_col[i*4+1]=rgb[1]; gl_col[i*4+2]=rgb[2]; gl_col[i*4+3]=1.0f;
 }
@@ -268,7 +275,8 @@ __global__ void update_emitted(
     float* es, float* gl_pos, float* gl_col,
     const int n_emit, const int n_origin, const float dt,
     const float lifetime, const float emit_bright, const float centroid,
-    const float t, const float bass, const float mid, const float high, const float beat)
+    const float t, const float bass, const float mid, const float high, const float beat,
+    const float harm_hue)
 {
     int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=n_emit) return;
     float px=es[i*7+0],py=es[i*7+1],pz=es[i*7+2];
@@ -290,7 +298,7 @@ __global__ void update_emitted(
         float env = fin * fout;
         float vlen=sqrtf(vx*vx+vy*vy+vz*vz)+1e-4f;
         float local=vz/vlen*0.5f+0.5f;
-        spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, 0.75f, rgb);
+        spectral_color(hash_f((unsigned int)i), local, t, bass, mid, high, beat, centroid, harm_hue, 0.75f, rgb);
         bright=emit_bright*env;                  // apparition + extinction douces
         alpha=1.0f;
     }
@@ -307,9 +315,9 @@ __global__ void update_emitted(
 # ===========================================================================
 _THREADS_PER_BLOCK = 256
 
-_FIELD_STRENGTH = 0.9
+_FIELD_STRENGTH = _CFG["_FIELD_STRENGTH"]
 _WAVE = 1.2
-_TURB_BASE = 0.25
+_TURB_BASE = _CFG["_TURB_BASE"]
 _EMIT_BRIGHT = 0.45        # luminosité de base d'une particule émise (fond à 0)
 
 _LZ_SIGMA, _LZ_RHO, _LZ_BETA = 10.0, 28.0, 2.6666667
@@ -341,9 +349,9 @@ _WAVE_KINDS = {
 # Couplage volontairement FAIBLE + PLAFONNÉ : on biaise la densité sans casser le
 # remplissage de l'espace (jamais d'effondrement en amas).
 _N_REL = 512                     # = AudioEngine.N_SPECTRUM
-_TONAL_STRENGTH = 0.7            # force du relief (0 = paysage tonal OFF)
+_TONAL_STRENGTH = _CFG["_TONAL_STRENGTH"]   # force du relief (0 = paysage tonal OFF)
 _TONAL_CAP = 1.3                 # plafond de la force radiale (anti-collapse)
-_TONAL_GLOW = 0.25               # lueur des strates énergétiques (les voir briller)
+_TONAL_GLOW = _CFG["_TONAL_GLOW"]   # lueur des strates énergétiques (les voir briller)
 _TONAL_TAU = 0.7                 # s — lissage du relief (grand = plus stable)
 
 # --- RESPIRATION (pouls anticipé) --------------------------------------------
@@ -352,7 +360,7 @@ _TONAL_TAU = 0.7                 # s — lissage du relief (grand = plus stable)
 # RADIAL transitoire et oscillant -> aucune accumulation nette (jamais d'amas) ;
 # porté par la confiance de groove (s'efface sur la musique sans pulsation nette).
 _BREATH_IN = 0.8                 # force de l'inspir (converge avant le temps fort)
-_BREATH_OUT = 1.5                # force de l'expir (s'épanouit sur le beat)
+_BREATH_OUT = _CFG["_BREATH_OUT"]   # force de l'expir (s'épanouit sur le beat)
 
 # --- CINÉMATIQUE : ÉTINCELLE DE CISAILLEMENT (accélération matérielle) ---------
 # |a| = Dv/Dt (différence finie de la vitesse des ORIGINES, quasi gratuite : la
@@ -362,8 +370,23 @@ _BREATH_OUT = 1.5                # force de l'expir (s'épanouit sur le beat)
 # local aux nœuds, SANS toucher la respiration audio (qui vit dans `val`, pas dans
 # `.w`). Origines seules (les émises sont balistiques, a≈0). inv_scale calé sur la
 # distribution mesurée de |a| (p50≈39, p90≈106, fronts≈250+).
-_ACCEL_GAIN = 0.4                # intensité du scintillement (0 = OFF)
+_ACCEL_GAIN = _CFG["_ACCEL_GAIN"]   # intensité du scintillement (0 = OFF)
 _ACCEL_INV_SCALE = 0.005         # échelle tanh de |a| (~1/p99 : bulk discret, fronts saturent)
+
+# --- PHRASE : build (charge) + drop (relâche viscérale) -----------------------
+# Le build RAMÈNE doucement la nuée vers le cœur, accélère le flux et l'assombrit
+# (le calme avant la tempête) ; le DROP la DÉTONE — bloom radial massif + onde de
+# choc CENTRALE + flash. Porté par groove_conf côté audio (pas de drop sur de
+# l'arythmique). Réglables (l'utilisateur a demandé « viscéral »).
+_BUILD_CONVERGE = _CFG["_BUILD_CONVERGE"]   # attraction vers le cœur pendant le build (charge)
+_DROP_BLOOM = _CFG["_DROP_BLOOM"]           # épanouissement radial violent au drop (relâche)
+
+# --- HARMONIE : teinte GLOBALE de la palette (modalité + tonalité) ------------
+# tonal_warmth (−1 mineur … +1 majeur) décale la TEMPÉRATURE : mineur -> froid
+# (teinte +), majeur -> chaud (teinte −) ; key_hue donne une teinte-maison par
+# tonalité. Lent (l'harmonie change sur des mesures). Réglables.
+_WARMTH_HUE = _CFG["_WARMTH_HUE"]       # ampleur du décalage chaud/froid selon la modalité
+_KEY_HUE_SPAN = _CFG["_KEY_HUE_SPAN"]   # étalement de teinte selon la tonalité (subtil)
 
 
 # ===========================================================================
@@ -494,6 +517,7 @@ class ParticleSystem:
         # On ne déclenche les ondes que sur un instantané NEUF (samples_written a
         # changé) -> un onset = un seul front, quel que soit le framerate.
         self._last_samples = -1
+        self._prev_drop = 0.0        # front montant du drop -> onde de choc centrale
         self._wpar_cpu = np.zeros(_MAX_WAVES * 6, dtype=np.float32)  # staging CPU
         self._wpos_gpu = cp.zeros(_MAX_WAVES * 3, dtype=f32)         # épicentres (VRAM)
         self._wpar_gpu = cp.zeros(_MAX_WAVES * 6, dtype=f32)         # paramètres (VRAM)
@@ -552,9 +576,18 @@ class ParticleSystem:
             self._init_fallback()
 
     def _init_fallback(self):
+        # Le REPLI alloue 2 buffers CuPy de plus (n_total*4 floats chacun) en VRAM.
+        # Sur une carte serrée où le zéro-copie a échoué, ça peut manquer de mémoire
+        # -> on échoue PROPREMENT (message actionnable) plutôt qu'avec un OOM brut.
         self._interop = False
-        self._fallback_pos = cp.empty(self.n_total * 4, dtype=cp.float32)
-        self._fallback_col = cp.empty(self.n_total * 4, dtype=cp.float32)
+        try:
+            self._fallback_pos = cp.empty(self.n_total * 4, dtype=cp.float32)
+            self._fallback_col = cp.empty(self.n_total * 4, dtype=cp.float32)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[particles] VRAM insuffisante pour le repli upload à "
+                f"{self.n_total:,} particules. Baissez N_PARTICLES / EMIT_RATE / "
+                f"EMITTED_LIFETIME dans la fenêtre de config.") from exc
 
     def _switch_to_fallback(self):
         if self._gl is not None:
@@ -591,6 +624,23 @@ class ParticleSystem:
         return (x*_LZ_NX, y*_LZ_NY, (z-_LZ_ZC)*_LZ_NZ)
 
     # ----------------------------------------------- ondes de choc / relief tonal
+    def _spawn_drop_wave(self):
+        """DROP : une onde de choc CENTRALE géante (depuis le cœur), bien plus forte
+        et épaisse qu'un onset normal -> un mur de lumière qui balaie toute la boîte."""
+        slot = self._wave_head
+        self._wave_head = (slot + 1) % _MAX_WAVES
+        self._wave_pos[slot, 0] = 0.0
+        self._wave_pos[slot, 1] = 0.0
+        self._wave_pos[slot, 2] = 0.0
+        self._wave_age[slot] = 0.0
+        self._wave_str0[slot] = 1.6
+        self._wave_speed[slot] = 7.0          # traverse toute la boîte (~0.8 s)
+        self._wave_thick[slot] = 0.9          # coque épaisse = mur de choc
+        self._wave_push[slot] = 3.5           # poussée massive vers l'extérieur
+        self._wave_curl[slot] = 0.0
+        self._wave_brt[slot] = 1.0            # éclat fort
+        self._wave_tau[slot] = 0.8
+
     def _spawn_wave(self, kind, strength, la, lb, lc):
         """Allume un nouveau front (anneau : écrase le plus ancien). L'épicentre
         est l'état du Lorenz CACHÉ (la,lb,lc, ~[-1,1]) projeté dans la boîte, avec
@@ -701,11 +751,26 @@ class ParticleSystem:
         # une musique sans pulsation nette (groove_conf -> 0).
         conf = float(getattr(features, "groove_conf", 0.0)) if features is not None else 0.0
         antic = float(getattr(features, "anticipation", 0.0)) if features is not None else 0.0
-        breath = _BREATH_OUT * beat * conf - _BREATH_IN * antic
+        build = float(getattr(features, "build", 0.0)) if features is not None else 0.0
+        drop = float(getattr(features, "drop", 0.0)) if features is not None else 0.0
+        warmth = float(getattr(features, "tonal_warmth", 0.0)) if features is not None else 0.0
+        key_hue = float(getattr(features, "key_hue", 0.0)) if features is not None else 0.0
+        # HARMONIE -> décalage de teinte GLOBAL : modalité (mineur -> froid/teinte+,
+        # majeur -> chaud/teinte−) + teinte-maison de la tonalité. Un seul scalaire
+        # passé aux deux kernels (couleur lente, sur des mesures).
+        harm_hue = -_WARMTH_HUE * warmth + _KEY_HUE_SPAN * key_hue
+        # Respiration par-battement + PHRASE : le build RAMÈNE vers le cœur (charge),
+        # le drop ÉPANOUIT violemment (relâche) ET engendre une onde de choc CENTRALE
+        # au front montant -> impact viscéral.
+        breath = (_BREATH_OUT * beat * conf - _BREATH_IN * antic
+                  + _DROP_BLOOM * drop - _BUILD_CONVERGE * build)
+        if drop > 0.5 and self._prev_drop <= 0.5:
+            self._spawn_drop_wave()
+        self._prev_drop = drop
 
         self._cur = dict(dt=dt, la=la, lb=lb, lc=lc, k=k, amp=amp, beat=beat, E=E,
                          head=self._emit_head, bass=bass, mid=mid, high=high,
-                         breath=breath)
+                         breath=breath, build=build, drop=drop, harm_hue=harm_hue)
 
         if self._interop:
             self._update_interop()
@@ -730,7 +795,8 @@ class ParticleSystem:
                 self._wpos_gpu, self._wpar_gpu, i32(_MAX_WAVES),
                 self._relief_gpu, i32(_N_REL),
                 f32(_TONAL_STRENGTH), f32(_TONAL_CAP), f32(_TONAL_GLOW),
-                f32(c["breath"]), f32(_ACCEL_GAIN), f32(_ACCEL_INV_SCALE)))
+                f32(c["breath"]), f32(_ACCEL_GAIN), f32(_ACCEL_INV_SCALE),
+                f32(c["build"]), f32(c["drop"]), f32(c["harm_hue"])))
             if c["E"] > 0:
                 g_emit = ((c["E"] + _THREADS_PER_BLOCK - 1) // _THREADS_PER_BLOCK, 1, 1)
                 self._k_emit(g_emit, self._block, (
@@ -740,7 +806,8 @@ class ParticleSystem:
                 self.emit_state, gl_pos, gl_col,
                 i32(self.n_emit), i32(self.n_origin), f32(c["dt"]),
                 f32(self.lifetime), f32(_EMIT_BRIGHT), f32(self._centroid),
-                f32(self._t), f32(c["bass"]), f32(c["mid"]), f32(c["high"]), f32(c["beat"])))
+                f32(self._t), f32(c["bass"]), f32(c["mid"]), f32(c["high"]), f32(c["beat"]),
+                f32(c["harm_hue"])))
 
     def _update_interop(self):
         arr = self._res_array

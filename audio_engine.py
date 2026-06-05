@@ -156,6 +156,19 @@ class AudioFeatures:
     bar_phase: float = 0.0       # phase lente sur 4 temps [0,1) (« houle » de mesure)
     groove_conf: float = 0.0     # confiance du verrouillage [0,1] (porte tout l'effet)
     anticipation: float = 0.0    # [0,1] : monte AVANT le temps fort prédit (l'inspir)
+    # --- EXTENSIONS (non-cassantes) : ANTICIPATION DE PHRASE (build / drop).
+    # Échelle SUPÉRIEURE au battement : la TENSION qui s'accumule pendant un build
+    # (filtre qui s'ouvre, roulement qui accélère, sub qui se retire) PUIS le DROP
+    # (relâche quand le sub/kick claque de nouveau). Gated par groove_conf.
+    build: float = 0.0           # [0,1] : charge de tension qui s'accumule (avant le drop)
+    drop: float = 0.0            # [0,1] : impulsion de relâche au drop (décroît)
+    phrase_phase: float = 0.0    # [0,1] : phase de phrase, recalée au drop
+    # --- EXTENSIONS (non-cassantes) : COULEUR DE L'HARMONIE.
+    # Chroma 12 classes -> corrélation aux profils de tonalité (Krumhansl) :
+    # tonal_warmth = axe MAJEUR(chaud)/MINEUR(froid) ; key_hue = teinte-maison de la
+    # tonalité. Très LENTS (l'harmonie change sur des mesures). Teintent la palette.
+    tonal_warmth: float = 0.0    # [-1,1] : +1 majeur (chaud) … -1 mineur (froid)
+    key_hue: float = 0.0         # [0,1) : fondamentale estimée / 12 (teinte-maison)
 
 
 # ===========================================================================
@@ -447,6 +460,8 @@ class AudioEngine:
         # spectrum_matrix (N_SPECTRUM x Nbins) : magnitude moyenne par bin log.
         self._band_matrix = cp.asarray(self._build_band_matrix(freqs_np))
         self._spectrum_matrix = cp.asarray(self._build_spectrum_matrix(freqs_np))
+        # Analyse HARMONIQUE : matrice chroma 12 classes + profils de tonalité.
+        self._build_harmony()
 
         # ------------------------------------------------------------------ #
         #  État de lissage / normalisation (CPU, scalaires) — persistant     #
@@ -499,6 +514,20 @@ class AudioEngine:
         self._tempo_last_t = 0.0    # horodatage du dernier update de phase
         self._tempo_last_beat_t = -1.0  # dernier battement encaissé
         self._bar_count = 0         # compteur de temps (0..3) -> phase de mesure
+
+        # TRAQUEUR DE PHRASE (build / drop) — échelle macro, gated par le verrou.
+        # Tension = filtre qui s'ouvre (centroïde + aigus) + activité percussive ;
+        # un BUILD = tension qui monte sur des secondes (fast EMA > slow EMA) ; un
+        # DROP = le sub qui SLAMME de nouveau alors qu'un build était chargé.
+        self._phrase_bars = 8       # longueur de phrase (mesures de 4 temps)
+        self._tension_fast = 0.0    # EMA rapide de la tension (~1 s)
+        self._tension_slow = 0.0    # EMA lente (~plusieurs s) -> ligne de base
+        self._bass_slow = 0.0       # EMA lente du grave (pour détecter le SLAM)
+        self._build = 0.0           # charge lissée [0,1]
+        self._build_target = 0.0    # cible de charge (mise à jour à l'analyse)
+        self._drop_env = 0.0        # impulsion de drop (décroît)
+        self._last_drop_t = -10.0   # anti-rebond entre deux drops
+        self._phrase_beat = 0       # compteur de temps DANS la phrase
 
         # Cadence d'analyse : on évite de relancer une FFT plus souvent que
         # nécessaire (si get_features est appelé à 240 fps alors qu'un nouveau
@@ -827,6 +856,12 @@ class AudioEngine:
         # bas niveau visuellement, sans le coût d'un log complet.
         g_spec = cp.sqrt(g_spec + 1e-12)
 
+        # --- HARMONIE : chroma 12 classes (réduction diffusée, reste GPU) puis
+        #     corrélation aux profils de tonalité (Krumhansl) -> warmth + key_hue.
+        g_chroma = cp.sum(self._chroma_matrix_gpu * g_spec[None, :], axis=1)   # (12,)
+        warmth_now, key_hue_now = self._update_harmony(
+            cp.asnumpy(g_chroma).astype(np.float64))
+
         # ---- RAPATRIEMENT GPU->CPU : seulement 4 + 1 scalaires ----
         band_rms = cp.asnumpy(g_band_rms).astype(np.float32)        # (4,)
         centroid_hz = float(cp.asnumpy(g_centroid_hz))
@@ -877,6 +912,10 @@ class AudioEngine:
             float(band_rms[1] + band_rms[2]), now)
         hat_s, hat_h = self._onset_hat.update(float(band_rms[3]), now)
 
+        # --- Traqueur de PHRASE (build/drop) sur les features lissées/normalisées.
+        self._phrase_detect(high=float(sm_bands[3]), centroid=centroid_norm,
+                            snare=snare_s, hat=hat_s, bass=float(sm_bands[0]), now=now)
+
         return AudioFeatures(
             bass=float(sm_bands[0]),
             low_mid=float(sm_bands[1]),
@@ -890,6 +929,7 @@ class AudioEngine:
             t=0.0,   # rempli par get_features()
             kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
             kick_hit=bool(kick_h), snare_hit=bool(snare_h), hat_hit=bool(hat_h),
+            tonal_warmth=float(warmth_now), key_hue=float(key_hue_now),
         )
 
     # ------------------------------------------------------------------ #
@@ -959,6 +999,118 @@ class AudioEngine:
         return float(min(self._beat_env, 1.0)), is_beat
 
     # ------------------------------------------------------------------ #
+    #  Analyse HARMONIQUE : chroma 12 classes + profils de tonalité Krumhansl.
+    # ------------------------------------------------------------------ #
+    def _build_harmony(self):
+        """Pré-calcule la matrice chroma (12 x N_SPECTRUM) et les 24 profils de
+        tonalité (majeur/mineur × 12 rotations) normalisés pour la corrélation."""
+        # Centres (Hz) des N_SPECTRUM bins log du spectre downsamplé.
+        edges = np.logspace(np.log10(self.SPECTRUM_FMIN),
+                            np.log10(self.SPECTRUM_FMAX), self.N_SPECTRUM + 1)
+        centers = np.sqrt(edges[:-1] * edges[1:])
+        # Chroma : chaque bin de la PLAGE HARMONIQUE contribue à sa classe de
+        # hauteur (pc = round(12·log2(f/C0)) % 12). On exclut le très grave et les
+        # aigus (cymbales/bruit) qui brouilleraient l'estimation tonale.
+        HARM_FMIN, HARM_FMAX, C0 = 55.0, 2000.0, 16.351597831287414
+        cm = np.zeros((12, self.N_SPECTRUM), dtype=np.float32)
+        for i, f in enumerate(centers):
+            if HARM_FMIN <= f <= HARM_FMAX:
+                pc = int(round(12.0 * np.log2(f / C0))) % 12
+                cm[pc, i] = 1.0
+        self._chroma_matrix_gpu = cp.asarray(cm)
+        # Profils Krumhansl-Schmuckler (poids par classe, clé en 0).
+        ks_major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
+                             2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        ks_minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
+                             2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+        def _normp(v):
+            v = v - v.mean()
+            return v / (np.linalg.norm(v) + 1e-9)
+
+        rows, major_flag, root_idx = [], [], []
+        for root in range(12):
+            rows.append(_normp(np.roll(ks_major, root))); major_flag.append(True); root_idx.append(root)
+            rows.append(_normp(np.roll(ks_minor, root))); major_flag.append(False); root_idx.append(root)
+        self._ks_mat = np.array(rows, dtype=np.float64)        # (24, 12) corrélation
+        self._ks_major = np.array(major_flag, dtype=bool)      # (24,)
+        self._ks_root = np.array(root_idx, dtype=np.int32)     # (24,)
+        # État lissé (l'harmonie est lente).
+        self._chroma = np.zeros(12, dtype=np.float64)
+        self._tonal_warmth = 0.0
+        self._key_root = 0
+        self._key_counter = 0
+
+    def _update_harmony(self, chroma):
+        """Lisse le chroma, corrèle aux profils -> (tonal_warmth, key_hue).
+        warmth = meilleure corrélation MAJEUR − meilleure MINEUR (chaud vs froid) ;
+        key_hue = fondamentale du meilleur profil, avec hystérésis anti-clignotement."""
+        self._chroma += 0.025 * (chroma - self._chroma)        # ~0.5 s
+        c = self._chroma - self._chroma.mean()
+        nrm = float(np.linalg.norm(c))
+        if nrm < 1e-6:                                          # pas d'harmonie nette
+            self._tonal_warmth *= 0.98
+            return self._tonal_warmth, self._key_root / 12.0
+        scores = self._ks_mat @ (c / nrm)                      # (24,) corrélations
+        c_maj = float(scores[self._ks_major].max())
+        c_min = float(scores[~self._ks_major].max())
+        warmth_raw = (c_maj - c_min) * 2.0
+        if warmth_raw > 1.0:
+            warmth_raw = 1.0
+        elif warmth_raw < -1.0:
+            warmth_raw = -1.0
+        self._tonal_warmth += 0.02 * (warmth_raw - self._tonal_warmth)   # ~0.8 s
+        # Tonalité (teinte-maison) : hystérésis pour ne pas clignoter entre clés.
+        best = int(np.argmax(scores))
+        best_root = int(self._ks_root[best])
+        cur_score = float(scores[self._ks_root == self._key_root].max())
+        if best_root != self._key_root and float(scores[best]) > cur_score + 0.04:
+            self._key_counter += 1
+            if self._key_counter >= 3:
+                self._key_root = best_root
+                self._key_counter = 0
+        else:
+            self._key_counter = 0
+        return self._tonal_warmth, self._key_root / 12.0
+
+    # ------------------------------------------------------------------ #
+    #  Traqueur de PHRASE : détecte le BUILD (tension qui monte) et le DROP
+    #  (le sub qui claque après un build). Appelé à l'ANALYSE (signaux frais) ;
+    #  le lissage par-frame de build/drop vit dans _apply_tempo.
+    # ------------------------------------------------------------------ #
+    def _phrase_detect(self, high, centroid, snare, hat, bass, now):
+        # Tension = filtre ouvert (aigus + centroïde) + activité percussive haute.
+        act = 0.5 * (snare + hat)
+        tension = 0.40 * high + 0.30 * centroid + 0.30 * act
+        self._tension_fast += 0.06 * (tension - self._tension_fast)     # ~1 s
+        self._tension_slow += 0.012 * (tension - self._tension_slow)    # ~plusieurs s
+        self._bass_slow += 0.02 * (bass - self._bass_slow)
+
+        conf = self._tempo_conf
+        # BUILD = tension AU-DESSUS de sa ligne de base (= ça monte), porté par le
+        # verrou de tempo (aucun build sur de l'arythmique).
+        # Composante « ça monte » (tendance fast>slow) + bonus « tension haute
+        # soutenue » -> un build long et énergique charge vraiment, pas juste sa pente.
+        bt = (self._tension_fast - self._tension_slow) * 4.0
+        bt += 0.4 * max(0.0, self._tension_fast - 0.45)
+        if bt < 0.0:
+            bt = 0.0
+        elif bt > 1.0:
+            bt = 1.0
+        self._build_target = bt * conf
+
+        # DROP = le grave SLAMME de nouveau (surge vs ligne de base) ALORS qu'un
+        # build était chargé. Précondition build + surge + verrou + réfractaire.
+        bass_surge = bass - self._bass_slow
+        if (self._build > 0.30 and bass_surge > 0.22 and conf > 0.40
+                and (now - self._last_drop_t) > 2.0):
+            self._drop_env = 1.0
+            self._last_drop_t = now
+            self._phrase_beat = 0          # le drop = frontière de phrase
+            self._build = 0.0              # décharge immédiate
+            self._build_target = 0.0
+
+    # ------------------------------------------------------------------ #
     #  Oscillateur de TEMPO/PHASE : entraînement au groove + anticipation.
     #  Appelé à CHAQUE frame (même cache) pour que la phase avance en continu ;
     #  ne corrige période/phase QUE sur un battement frais (`beat_now`).
@@ -977,6 +1129,7 @@ class AudioEngine:
         while self._tempo_phase >= 1.0:           # franchissement d'un temps prédit
             self._tempo_phase -= 1.0
             self._bar_count = (self._bar_count + 1) & 3   # 0..3 (mesure 4 temps)
+            self._phrase_beat = (self._phrase_beat + 1) % (self._phrase_bars * 4)
 
         # 2) Correction sur un battement FRAIS (oscillateur adaptatif).
         if beat_now:
@@ -1055,6 +1208,19 @@ class AudioEngine:
         feats.groove_conf = float(conf)
         feats.anticipation = float(tension * conf)
 
+        # 5) PHRASE (échelle macro). La charge a une attaque LENTE (~2 s : "ça se
+        #    charge sur des mesures") et un release plus vif ; le drop s'épanouit
+        #    puis retombe. phrase_phase recalée au drop (cf. _phrase_detect).
+        if self._build_target > self._build:
+            self._build += (1.0 - math.exp(-dt / 1.2)) * (self._build_target - self._build)
+        else:
+            self._build += (1.0 - math.exp(-dt / 0.5)) * (self._build_target - self._build)
+        self._drop_env *= math.exp(-dt / 1.2)
+        feats.build = float(self._build)
+        feats.drop = float(min(self._drop_env, 1.0))
+        feats.phrase_phase = float((self._phrase_beat + self._tempo_phase)
+                                   / max(1, self._phrase_bars * 4))
+
     # ------------------------------------------------------------------ #
     #  Features « silence » : décroissance douce, spectrum_gpu valide.   #
     # ------------------------------------------------------------------ #
@@ -1078,6 +1244,8 @@ class AudioEngine:
         kick_s = self._onset_kick.decay_only()
         snare_s = self._onset_snare.decay_only()
         hat_s = self._onset_hat.decay_only()
+        self._build_target = 0.0     # plus de tension en silence -> la charge se relâche
+        self._tonal_warmth *= 0.97   # plus d'harmonie -> retour au neutre (gris)
 
         return AudioFeatures(
             bass=float(self._env_bands[0]),
@@ -1092,6 +1260,7 @@ class AudioEngine:
             t=0.0,   # rempli par get_features()
             kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
             kick_hit=False, snare_hit=False, hat_hit=False,
+            tonal_warmth=float(self._tonal_warmth), key_hue=float(self._key_root / 12.0),
         )
 
 

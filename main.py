@@ -33,6 +33,12 @@ from __future__ import annotations
 import sys
 import time
 
+# Le PARAMÉTRAGE par défaut vit dans config_window.DEFAULTS (SOURCE DE VÉRITÉ
+# unique, présentée dans la fenêtre de config au lancement). Les constantes de
+# l'en-tête ci-dessous le LISENT — elles ne codent plus aucune valeur en dur.
+# Import léger : config_window ne tire ni cupy ni moderngl (juste os/sys/json).
+from config_window import DEFAULTS as _CFG
+
 
 # #############################################################################
 # #                                                                           #
@@ -44,7 +50,7 @@ import time
 # Nombre de particules simulées. La RTX 4090 (24 Go VRAM, 16384 cœurs CUDA)
 # encaisse très largement quelques millions de particules. 5 millions donne un
 # nuage très dense ; on peut pousser à 8_000_000+ sur cette carte.
-N_PARTICLES = 2_500_000
+N_PARTICLES = _CFG["N_PARTICLES"]
 
 # Nuée qui REMPLIT l'espace visible, advectée par un champ dont les coefficients
 # sont un système de Lorenz CACHÉ (jamais affiché — il sous-tend la dynamique).
@@ -53,35 +59,35 @@ CLOUD_SHAPE = "lorenz"
 
 # Demi-côté de la BOÎTE de particules en unités monde (= l'espace visible rempli).
 # La caméra est cadrée pour ~3 ; l'augmenter agrandit la boîte.
-CLOUD_RADIUS = 2.5
+CLOUD_RADIUS = _CFG["CLOUD_RADIUS"]
 
 # Taille apparente des particules en PIXELS écran (constante : ne varie ni avec
 # la distance ni avec l'audio). Plus petit = grain fin façon champ d'étoiles ET
 # moins de recouvrement additif -> moins de saturation blanche. ~3 est un bon
 # point de départ pour plusieurs millions de particules. Petit = grain fin, on
 # distingue chaque particule (anti-agrégation).
-PARTICLE_SIZE = 0.5
+PARTICLE_SIZE = _CFG["PARTICLE_SIZE"]
 
 # --- ÉMISSION DE TRAÎNÉES ÉPHÉMÈRES ------------------------------------------
 # Chaque particule d'ORIGINE émet des particules de courte durée de vie, lancées
 # dans la direction de son déplacement immédiat -> traînées qui révèlent le flux.
 # Total affiché ≈ N_PARTICLES * (1 + EMIT_RATE * EMITTED_LIFETIME) -> dizaines de M.
-EMITTED_LIFETIME = 10.0    # durée de vie (s) des particules émises
-EMIT_RATE = 5.0           # émissions par particule d'origine et par seconde
+EMITTED_LIFETIME = _CFG["EMITTED_LIFETIME"]   # durée de vie (s) des particules émises
+EMIT_RATE = _CFG["EMIT_RATE"]                 # émissions par particule d'origine et par seconde
 
 
 # --- FENÊTRE & CONTEXTE ------------------------------------------------------
 # True  -> plein écran sur le moniteur primaire (résolution native).
 # False -> fenêtré redimensionnable de taille WINDOW_W x WINDOW_H.
-FULLSCREEN = False
-WINDOW_W = 1280
-WINDOW_H = 720
+FULLSCREEN = _CFG["FULLSCREEN"]
+WINDOW_W = _CFG["WINDOW_W"]
+WINDOW_H = _CFG["WINDOW_H"]
 
 # SUPERSAMPLING interne : on rend à (résolution_écran * SUPERSAMPLE_FACTOR) puis
 # on réduit à l'affichage -> anti-aliasing « gratuit » et particules très nettes.
 # 1.0 = natif, 1.5 = ~2.25x de pixels, 2.0 = 4x de pixels (réservé à la 4090).
 # La résolution interne est bornée (voir MAX_RENDER_PIXELS) pour rester sain.
-SUPERSAMPLE_FACTOR = 1.0
+SUPERSAMPLE_FACTOR = _CFG["SUPERSAMPLE_FACTOR"]
 
 # Plafond de pixels rendus en interne (garde-fou anti-explosion VRAM/charge).
 # ~ 3840*2160*2.25 par défaut ; au-delà on réduit automatiquement le SS effectif.
@@ -92,22 +98,22 @@ MAX_RENDER_PIXELS = 10_000_000_000
 MSAA_SAMPLES = 2
 
 # vsync : True -> synchronisé au moniteur (pas de tearing). False -> FPS max.
-VSYNC = True
+VSYNC = _CFG["VSYNC"]
 
 
 # --- POST-TRAITEMENT (look cinématographique) --------------------------------
-ENABLE_BLOOM = False           # OFF : pas de halo d'agrégation -> chaque particule nette
-ENABLE_MOTION_BLUR = False     # OFF : pas de traînée -> particules nettes, distinctes
-MOTION_BLUR_STRENGTH = 0.15    # 0 = aucune traînée, ->1 = traînées très longues
-BLOOM_INTENSITY = 0.3          # dosage du halo (réduit -> moins d'amas « plasma »)
+ENABLE_BLOOM = _CFG["ENABLE_BLOOM"]               # OFF : pas de halo d'agrégation -> chaque particule nette
+ENABLE_MOTION_BLUR = _CFG["ENABLE_MOTION_BLUR"]   # OFF : pas de traînée -> particules nettes, distinctes
+MOTION_BLUR_STRENGTH = _CFG["MOTION_BLUR_STRENGTH"]  # 0 = aucune traînée, ->1 = traînées très longues
+BLOOM_INTENSITY = _CFG["BLOOM_INTENSITY"]         # dosage du halo (réduit -> moins d'amas « plasma »)
 BLOOM_THRESHOLD = 1.7          # seuil de luminance HDR (élevé -> seuls les vrais pics saignent)
-EXPOSURE = 0.15                # exposition basse : ADAPTÉE à ~35M (grain net, ~0% blanc).
+EXPOSURE = _CFG["EXPOSURE"]                       # exposition basse : ADAPTÉE à ~35M (grain net, ~0% blanc).
 #                                Plus de particules = additif plus fort -> baisser l'expo.
 
 # DÉBRUITAGE à-trous : lisse le bruit de speckle (particules éparses) en une
 # nébuleuse soyeuse, tout en préservant les filaments. ON par défaut.
-ENABLE_DENOISE = True
-DENOISE_SIGMA = 0.01            # force ; + grand = + lisse (mais filaments moins nets)
+ENABLE_DENOISE = _CFG["ENABLE_DENOISE"]
+DENOISE_SIGMA = _CFG["DENOISE_SIGMA"]   # force ; + grand = + lisse (mais filaments moins nets)
 DENOISE_ITERS = 7             # nb de passes à-trous (+ = rayon large, + lisse)
 
 
@@ -116,15 +122,15 @@ DENOISE_ITERS = 7             # nb de passes à-trous (+ = rayon large, + lisse)
 # ffmpeg fourni par imageio-ffmpeg (aucune install système). Fichier .mp4 écrit
 # dans RECORD_DIR, à cadence fixe. L'écriture se fait dans un thread dédié : la
 # boucle de rendu n'est jamais figée par l'encodeur.
-RECORD_ENCODER = "nvenc"       # "x265" = encodeur LOGICIEL (qualité MAX, + lent ; bien
+RECORD_ENCODER = _CFG["RECORD_ENCODER"]   # "x265" = encodeur LOGICIEL (qualité MAX, + lent ; bien
                                #   meilleur sur notre contenu sombre/granuleux : préserve
                                #   le grain et les filaments au lieu de les lisser).
                                #   "nvenc" = encodeur MATÉRIEL GPU (temps réel garanti).
-RECORD_FPS = 30                # images/s de la vidéo (pacing horloge -> timing correct).
+RECORD_FPS = _CFG["RECORD_FPS"]   # images/s de la vidéo (pacing horloge -> timing correct).
                                #   NB : le visuel n'avance qu'au rythme du RENDU ; au-delà,
                                #   les images sont DUPLIQUÉES.
 RECORD_DIR = "."               # dossier de sortie des enregistrements
-RECORD_QUALITY = 21            # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
+RECORD_QUALITY = _CFG["RECORD_QUALITY"]   # x265 CRF / NVENC CQ — plus bas = meilleure qualité (+ gros).
                                #   x265 : ~18 = excellent, ~16 = quasi transparent.
 RECORD_PRESET = "p5"           # x265 : ultrafast..placebo (medium = bon équilibre ; si trop
                                #   de frames sont droppées, passe à "fast"/"faster").
@@ -132,7 +138,7 @@ RECORD_PRESET = "p5"           # x265 : ultrafast..placebo (medium = bon équili
 RECORD_PIXFMT = "p010le"       # 10 bits 4:2:0 (Main10, tue le banding)(yuv420p10le). Autres :
                                #   "yuv444p10le" = 4:4:4 (chroma pleine, filaments nets) ;
                                #   "yuv420p" = 8 bits (ancien comportement).
-RECORD_AUDIO_BITRATE = "192k"  # piste AUDIO AAC stéréo 48 kHz muxée dans la vidéo. C'est le son
+RECORD_AUDIO_BITRATE = _CFG["RECORD_AUDIO_BITRATE"]  # piste AUDIO AAC stéréo 48 kHz muxée dans la vidéo. C'est le son
                                #   SYSTÈME capté en loopback (ce que tu entends), dérivé du moteur
                                #   audio -> synchrone avec l'image. Mets "" (ou None) pour muet.
 
@@ -141,8 +147,8 @@ RECORD_AUDIO_BITRATE = "192k"  # piste AUDIO AAC stéréo 48 kHz muxée dans la 
 # 'fixed'         -> caméra immobile.
 # 'auto_rotate'   -> rotation continue autour du nuage.
 # 'beat_reactive' -> rotation + impulsions/zoom rythmés par les beats audio.
-CAMERA_MODE = "beat_reactive"
-CAMERA_ROTATE_SPEED = 0.15     # vitesse de rotation (rad/s) pour les modes auto.
+CAMERA_MODE = _CFG["CAMERA_MODE"]
+CAMERA_ROTATE_SPEED = _CFG["CAMERA_ROTATE_SPEED"]   # vitesse de rotation (rad/s) pour les modes auto.
 
 
 # --- AUDIO -------------------------------------------------------------------
@@ -245,8 +251,73 @@ class _FpsCounter:
         return False
 
 
+def _max_total_particles(n_origin, render_w, render_h, msaa):
+    """Plafond RIGOUREUX de n_total (origines + émises), calculé sur le MATÉRIEL
+    courant — donc valable quelle que soit la carte. C'est le MINIMUM de :
+
+      (A) LIMITE D'INDEX 32 BITS des buffers GL : chaque buffer (pos, col) fait
+          n_total * 16 octets, et moderngl/GL indexe offset/taille en int32 signé
+          -> n_total * 16 doit rester < 2^31 (sinon overflow -> crash). Marge 64 Mo.
+
+      (B) LIMITE VRAM : ce que la mémoire GPU LIBRE permet, en mode zéro-copie.
+          Bilan exact par particule (octets) :
+            buffers GL pos+col           = 32 * n_total
+            état CUDA pos+vel (origines) = 24 * n_origin
+            état CUDA emit (émises)      = 28 * (n_total - n_origin)
+          => 60 * n_total - 4 * n_origin.
+          On retire d'abord les framebuffers de rendu (HDR+MSAA+post-FX, fonction
+          de la résolution) et une marge (pool cupy, fragmentation, headroom driver).
+
+    Renvoie un entier (>= n_origin tant que la carte peut tenir les origines)."""
+    cap_int32 = (2**31 - 1 - 64 * 1024 * 1024) // 16            # ~130,1 M
+
+    try:
+        import cupy as cp
+        with cp.cuda.Device(0):
+            free, total = cp.cuda.runtime.memGetInfo()
+    except Exception:
+        return cap_int32                                       # pas de query -> int32 seule
+
+    px = max(1, int(render_w) * int(render_h))
+    m = max(1, int(msaa))
+    # Framebuffers de rendu (indép. du nb de particules) : RGBA16F HDR + resolve,
+    # renderbuffers MSAA couleur+depth, tampons post-FX (bloom/denoise) — généreux.
+    fb_bytes = px * (64 + 16 * m)
+    # Marge : pool/fragmentation cupy, matrices audio, headroom driver.
+    margin = max(int(total * 0.10), 512 * 1024 * 1024)
+    budget = max(0, free - fb_bytes - margin)
+    # 60*n_total - 4*n_origin <= budget  ->  n_total <= (budget + 4*n_origin)/60
+    cap_vram = (budget + 4 * n_origin) // 60
+
+    return int(max(n_origin, min(cap_int32, cap_vram)))
+
+
 def main():
     """Point d'entrée : construit tout, fait tourner la boucle, nettoie."""
+
+    # ----- FENÊTRE DE CONFIGURATION (au lancement, AVANT le moteur GPU) -------
+    # Ouvre une fenêtre thémée (TKinterModernThemes / park / dark) pour régler les
+    # paramètres sans toucher au code, puis applique les choix. run_config() rend :
+    #   dict  -> on lance avec ces réglages ; None -> annulé (on ferme) ;
+    #   False -> UI indisponible (tkinter/lib absent) -> on continue avec les défauts.
+    cfg, _MAIN_KEYS, _PARTICLE_KEYS = False, [], []
+    try:
+        from config_window import (run_config,
+                                    MAIN_KEYS as _MAIN_KEYS,
+                                    PARTICLE_KEYS as _PARTICLE_KEYS)
+        cfg = run_config()
+    except Exception as exc:
+        print(f"[main] Fenêtre de config indisponible ({exc}) -> défauts.",
+              file=sys.stderr)
+        cfg = False
+    if cfg is None:
+        print("[main] Configuration annulée — fermeture.", file=sys.stderr)
+        return 0
+    if cfg:                                  # dict -> applique les clés « main.py »
+        _g = globals()
+        for _k in _MAIN_KEYS:
+            if _k in cfg:
+                _g[_k] = cfg[_k]
 
     # ----- Imports « lourds » différés ---------------------------------------
     # On importe ici (et non en tête de module) pour que `python -m py_compile`
@@ -269,6 +340,15 @@ def main():
               file=sys.stderr)
         print("           uv pip install -r requirements.txt", file=sys.stderr)
         return 1
+
+    # Applique les réglages « particles.py » (constantes à préfixe _) choisis dans
+    # la fenêtre de config — lues au moment de l'update, donc un override par
+    # setattr AVANT de construire le ParticleSystem suffit.
+    if cfg:
+        import particles as _pmod
+        for _k in _PARTICLE_KEYS:
+            if _k in cfg:
+                setattr(_pmod, _k, cfg[_k])
 
     # Références déclarées à None pour un nettoyage sûr dans le finally même si
     # une étape de construction échoue à mi-chemin.
@@ -293,6 +373,17 @@ def main():
         # Comptes : origines (advectées) + émises (traînées éphémères, ring buffer).
         n_origin = N_PARTICLES
         n_emit = int(n_origin * EMIT_RATE * EMITTED_LIFETIME)
+        # GARDE-FOU CALCULÉ SUR LE MATÉRIEL : plafonne n_total au MIN de la limite
+        # d'index 32 bits des buffers GL et de ce que la VRAM LIBRE permet (cf.
+        # _max_total_particles). Réduire n_emit ne casse PAS le flux : le taux
+        # d'émission est dérivé de n_emit/lifetime -> pas de coupure franche.
+        _max_total = _max_total_particles(n_origin, render_w, render_h, MSAA_SAMPLES)
+        if n_origin + n_emit > _max_total:
+            _req = n_origin + n_emit
+            n_emit = max(0, _max_total - n_origin)
+            print(f"[main] Particules plafonnées (matériel) : {_req:,} demandées -> "
+                  f"{n_origin + n_emit:,} (VRAM libre + index 32 bits des buffers GL).",
+                  file=sys.stderr)
         n_total = n_origin + n_emit
         print(f"[main] Écran {screen_w}x{screen_h} | Rendu interne "
               f"{render_w}x{render_h} (SS x{ss_eff:.2f}) | {n_origin:,} origines + "
