@@ -32,6 +32,9 @@ DEFAULTS = {
     # Fenêtre & rendu
     "FULLSCREEN": False, "WINDOW_W": 1280, "WINDOW_H": 720, "VSYNC": True,
     "SUPERSAMPLE_FACTOR": 1.0, "ENABLE_DENOISE": True,
+    # 3D stéréoscopique (frame packing 1080p — œil G + 45 lignes + œil D, 24 Hz)
+    "STEREO_3D": False, "STEREO_EYE_SEP": 0.22, "STEREO_CONVERGENCE": 1.0,
+    "STEREO_SWAP_EYES": False,
     # Post-FX
     "ENABLE_BLOOM": False, "BLOOM_INTENSITY": 0.3,
     "ENABLE_MOTION_BLUR": False, "MOTION_BLUR_STRENGTH": 0.15, "DENOISE_SIGMA": 0.01,
@@ -96,6 +99,12 @@ GROUPS = [
         ("RECORD_FPS", "FPS capture", "int", (24, 120, 1)),
         ("RECORD_QUALITY", "Qualité (CQ/CRF)", "int", (10, 30, 1)),
         ("RECORD_AUDIO_BITRATE", "Audio", "choice", ["192k", "256k", "320k", _AUDIO_MUTE]),
+    ]),
+    ("🥽  3D stéréoscopique", (0, 3), [
+        ("STEREO_3D", "Relief 3D (frame packing)", "bool", None),
+        ("STEREO_EYE_SEP", "Écart des yeux", "float", (0.0, 1.0, 0.01)),
+        ("STEREO_CONVERGENCE", "Convergence", "float", (0.2, 3.0, 0.05)),
+        ("STEREO_SWAP_EYES", "Inverser G/D", "bool", None),
     ]),
 ]
 
@@ -236,6 +245,10 @@ TR = {
         "✦  Nuée": "✦  Cloud", "🪟  Fenêtre & rendu": "🪟  Window & rendering",
         "🥁  Rythme & flux": "🥁  Rhythm & flow", "🎨  Couleur & harmonie": "🎨  Colour & harmony",
         "🎥  Caméra & capture": "🎥  Camera & capture",
+        "🥽  3D stéréoscopique": "🥽  Stereoscopic 3D",
+        "Relief 3D (frame packing)": "3D depth (frame packing)",
+        "Écart des yeux": "Eye separation", "Convergence": "Convergence",
+        "Inverser G/D": "Swap L/R",
         "Particules": "Particles", "Rayon de la boîte": "Box radius",
         "Taille du point (px)": "Point size (px)", "Exposition HDR": "HDR exposure",
         "Taux d'émission": "Emission rate", "Vie des traînées (s)": "Trail lifetime (s)",
@@ -272,6 +285,10 @@ TR = {
         "✦  Nuée": "✦  Wolke", "🪟  Fenêtre & rendu": "🪟  Fenster & Rendering",
         "🥁  Rythme & flux": "🥁  Rhythmus & Fluss", "🎨  Couleur & harmonie": "🎨  Farbe & Harmonie",
         "🎥  Caméra & capture": "🎥  Kamera & Aufnahme",
+        "🥽  3D stéréoscopique": "🥽  Stereoskopisches 3D",
+        "Relief 3D (frame packing)": "3D-Tiefe (Frame Packing)",
+        "Écart des yeux": "Augenabstand", "Convergence": "Konvergenz",
+        "Inverser G/D": "L/R tauschen",
         "Particules": "Partikel", "Rayon de la boîte": "Box-Radius",
         "Taille du point (px)": "Punktgröße (px)", "Exposition HDR": "HDR-Belichtung",
         "Taux d'émission": "Emissionsrate", "Vie des traînées (s)": "Spur-Lebensdauer (s)",
@@ -308,6 +325,10 @@ TR = {
         "✦  Nuée": "✦  Nuvola", "🪟  Fenêtre & rendu": "🪟  Finestra & rendering",
         "🥁  Rythme & flux": "🥁  Ritmo & flusso", "🎨  Couleur & harmonie": "🎨  Colore & armonia",
         "🎥  Caméra & capture": "🎥  Camera & cattura",
+        "🥽  3D stéréoscopique": "🥽  3D stereoscopico",
+        "Relief 3D (frame packing)": "Rilievo 3D (frame packing)",
+        "Écart des yeux": "Distanza occhi", "Convergence": "Convergenza",
+        "Inverser G/D": "Inverti S/D",
         "Particules": "Particelle", "Rayon de la boîte": "Raggio del box",
         "Taille du point (px)": "Dim. punto (px)", "Exposition HDR": "Esposizione HDR",
         "Taux d'émission": "Tasso d'emissione", "Vie des traînées (s)": "Durata scie (s)",
@@ -344,6 +365,10 @@ TR = {
         "✦  Nuée": "✦  Nube", "🪟  Fenêtre & rendu": "🪟  Ventana y render",
         "🥁  Rythme & flux": "🥁  Ritmo y flujo", "🎨  Couleur & harmonie": "🎨  Color y armonía",
         "🎥  Caméra & capture": "🎥  Cámara y captura",
+        "🥽  3D stéréoscopique": "🥽  3D estereoscópico",
+        "Relief 3D (frame packing)": "Relieve 3D (frame packing)",
+        "Écart des yeux": "Separación de ojos", "Convergence": "Convergencia",
+        "Inverser G/D": "Invertir I/D",
         "Particules": "Partículas", "Rayon de la boîte": "Radio de la caja",
         "Taille du point (px)": "Tamaño punto (px)", "Exposition HDR": "Exposición HDR",
         "Taux d'émission": "Tasa de emisión", "Vie des traînées (s)": "Vida de estelas (s)",
@@ -482,7 +507,7 @@ def run_config(_test_build_only: bool = False):
             self._body = self.addFrame("body", row=0, col=0)
             b = self._body
 
-            top = b.addFrame("top", row=0, col=0, colspan=3)
+            top = b.addFrame("top", row=0, col=0, colspan=4)
             top.Label("S Y T H M", size=22, row=0, col=1)          # CENTRÉ (col 1, entre 2 colonnes égales)
             top.OptionMenu([AUTONYMS[c] for c in LANG_ORDER], self._lang_var,
                            command=self._on_lang, default=AUTONYMS[self.lang],
@@ -496,7 +521,9 @@ def run_config(_test_build_only: bool = False):
                 pass
 
             # --- Sélecteur de presets visuels (traduit) ----------------------
-            preset_fr = b.addLabelFrame(self._t("Presets visuels"), row=3, col=0, colspan=3)
+            # row=3 : sous les DEUX rangées de groupes (grille 2×4 ; le panneau « 3D
+            # stéréoscopique » occupe la case (0,3), en haut à droite).
+            preset_fr = b.addLabelFrame(self._t("Presets visuels"), row=3, col=0, colspan=4)
             if not hasattr(self, "_preset_key"):
                 self._preset_key = next(iter(PRESETS), "")
             # La var porte le nom AFFICHÉ (traduit) ; le nom CANONIQUE (clé FR de
@@ -528,7 +555,7 @@ def run_config(_test_build_only: bool = False):
                         lo, hi, st = params
                         fr.NumericalSpinbox(lo, hi, st, var, row=i, col=1)
 
-            bar = b.addFrame("bar", row=4, col=0, colspan=3)
+            bar = b.addFrame("bar", row=4, col=0, colspan=4)
             bar.Button(self._t("Réinitialiser"), self._reset, row=0, col=0)
             bar.AccentButton(self._t("Lancer Sythm  ▶"), self._launch, row=0, col=1)
             try:
@@ -635,6 +662,10 @@ def run_config(_test_build_only: bool = False):
             assert app.lang == _lc, f"langue {_lc} non prise"
         app._preset_var.set(app._t("Cosmique")); app._on_preset()   # nom affiché -> clé
         assert app._preset_key == "Cosmique", "mapping nom de preset traduit KO"
+        app.root.update_idletasks()
+        print(f"[config] GEOMETRIE requise (build + langues) : "
+              f"{app.root.winfo_reqwidth()}x{app.root.winfo_reqheight()} px",
+              file=sys.stderr)
         app.root.destroy()
         return True
 

@@ -228,14 +228,50 @@ class Window:
     # ------------------------------------------------------------------ #
     #  Plein écran BORDERLESS (bascule à chaud)                          #
     # ------------------------------------------------------------------ #
-    def toggle_fullscreen(self):
-        """Bascule entre fenêtré et PLEIN ÉCRAN BORDERLESS (fenêtre sans bordure
-        couvrant le moniteur primaire à sa résolution native). On n'utilise PAS
-        le plein écran exclusif : sous Windows, une appli OpenGL exclusive sans
-        surface HDR force l'écran en SDR (« HDR désactivé »). Le borderless
-        laisse le compositeur DWM actif -> le mode HDR de l'écran est conservé.
-        Mémorise la géométrie fenêtrée pour y revenir. Le changement de
-        framebuffer lève `resized` -> renderer/postfx se réajustent ensuite."""
+    def _pick_monitor(self):
+        """Moniteur SOUS la fenêtre (recouvrement max ; départage par le moniteur
+        contenant le CENTRE), sinon le primaire. Permet à F de passer en plein écran
+        sur l'AFFICHEUR où l'utilisateur a glissé la fenêtre (p.ex. un projecteur
+        3D), et non systématiquement sur le moniteur primaire."""
+        try:
+            wx, wy = glfw.get_window_pos(self.handle)
+            ww, wh = glfw.get_window_size(self.handle)
+        except Exception:
+            return glfw.get_primary_monitor()
+        wcx, wcy = wx + ww * 0.5, wy + wh * 0.5
+        best, best_area = None, -1.0
+        try:
+            monitors = glfw.get_monitors() or []
+        except Exception:
+            monitors = []
+        for m in monitors:
+            try:
+                mx, my = glfw.get_monitor_pos(m)
+                mode = glfw.get_video_mode(m)
+                mw, mh = mode.size.width, mode.size.height
+            except Exception:
+                continue
+            ox = max(0, min(wx + ww, mx + mw) - max(wx, mx))
+            oy = max(0, min(wy + wh, my + mh) - max(wy, my))
+            area = float(ox * oy)
+            if mx <= wcx < mx + mw and my <= wcy < my + mh:
+                area += 1e9          # le centre de la fenêtre est dedans -> priorité
+            if area > best_area:
+                best_area, best = area, m
+        return best or glfw.get_primary_monitor()
+
+    def toggle_fullscreen(self, exact=False):
+        """Bascule fenêtré <-> PLEIN ÉCRAN BORDERLESS sur le moniteur SOUS la fenêtre
+        (cf. _pick_monitor) — donc sur l'afficheur où on a glissé la fenêtre.
+
+        :param exact: False (mono) -> la fenêtre DÉBORDE de 1px par bord pour rester
+                      composée par DWM (HDR de l'écran CONSERVÉ ; pas de promotion
+                      SDR/independent-flip). True (STÉRÉO 3D) -> couverture EXACTE du
+                      moniteur à sa résolution native : sur un afficheur 3D en frame
+                      packing (1920x2205), le framebuffer fait pile cette taille ->
+                      empaquetage PIXEL-EXACT (un afficheur 3D n'est pas HDR ;
+                      l'alignement des lignes prime).
+        Mémorise la géométrie fenêtrée pour y revenir ; lève `resized`."""
         if self.handle is None:
             return
         if self._is_fullscreen:
@@ -246,28 +282,30 @@ class Window:
             glfw.set_window_monitor(self.handle, None, x, y, w, h, 0)
             self._is_fullscreen = False
         else:
-            # Mémorise la fenêtre courante, puis passe en borderless plein moniteur.
+            # Mémorise la fenêtre courante, puis passe en borderless sur le moniteur
+            # SOUS la fenêtre (pas forcément le primaire).
             try:
                 self._windowed_pos = glfw.get_window_pos(self.handle)
                 self._windowed_size = glfw.get_window_size(self.handle)
             except Exception:
                 pass
-            monitor = glfw.get_primary_monitor()
+            monitor = self._pick_monitor()
             mode = glfw.get_video_mode(monitor)
             try:
                 mx, my = glfw.get_monitor_pos(monitor)
             except Exception:
                 mx, my = 0, 0
-            # DECORATED=FALSE + fenêtre (monitor=None) = borderless. MAIS on la
-            # fait DÉBORDER de 1px hors écran sur chaque bord (pos -1, taille +2) :
-            # ainsi elle n'est PAS un calque EXACT du moniteur, donc Windows ne la
-            # promeut pas en "fullscreen optimization"/independent-flip (qui ferait
-            # retomber l'écran en SDR comme l'exclusif). DWM continue de composer
-            # -> le mode HDR de l'écran est CONSERVÉ. Le débordement (+2 par
-            # dimension) garde aussi des tailles PAIRES (requis par l'encodage 4:2:0).
             glfw.set_window_attrib(self.handle, glfw.DECORATED, glfw.FALSE)
-            glfw.set_window_monitor(self.handle, None, mx - 1, my - 1,
-                                    mode.size.width + 2, mode.size.height + 2, 0)
+            if exact:
+                # Couverture EXACTE du moniteur -> frame packing pixel-exact (cf.
+                # docstring). Origine + taille natives, aucun débordement.
+                glfw.set_window_monitor(self.handle, None, mx, my,
+                                        mode.size.width, mode.size.height, 0)
+            else:
+                # Débordement de 1px par bord : DWM compose -> HDR de l'écran
+                # CONSERVÉ (pas d'independent-flip / SDR). Tailles PAIRES (4:2:0).
+                glfw.set_window_monitor(self.handle, None, mx - 1, my - 1,
+                                        mode.size.width + 2, mode.size.height + 2, 0)
             self._is_fullscreen = True
         # Le changement peut réinitialiser le swap interval : on le réapplique.
         glfw.swap_interval(1 if getattr(self.config, "vsync", True) else 0)
@@ -275,9 +313,7 @@ class Window:
         fb_w, fb_h = glfw.get_framebuffer_size(self.handle)
         self._fb_size = (fb_w, fb_h)
         self._resized = True
-        # Curseur : on le rend visible et on réarme le délai d'inactivité (3 s de
-        # grâce après la bascule) ; en plein écran il se re-masquera tout seul si
-        # l'on ne bouge plus.
+        # Curseur : visible + réarme le délai d'inactivité (3 s de grâce).
         self._set_cursor_visible(True)
         self._last_motion_time = glfw.get_time()
         try:

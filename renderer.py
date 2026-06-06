@@ -24,7 +24,9 @@ Contrat partage (respecte a la lettre) :
         @property pos_buffer -> moderngl.Buffer      # N*vec4 (x,y,z,brightness)
         @property col_buffer -> moderngl.Buffer      # N*vec4 (r,g,b,a) HDR lineaire
         def update_camera(self, t, features): ...
-        def render(self) -> moderngl.Texture          # texture HDR RGBA16F resolue
+        def enable_stereo(self, enabled=True, iod=None,
+                          convergence_scale=None): ...   # STEREO off-axis (relief reel)
+        def render(self, eye=0) -> moderngl.Texture       # eye 0=mono, -1/+1=oeil G/D off-axis
         def resize(self, width, height): ...
 
 LAYOUT DES BUFFERS (verrou interop CUDA, cf. ParticleSystem) :
@@ -115,6 +117,27 @@ def _look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     m[0, 3] = -np.dot(side, eye)
     m[1, 3] = -np.dot(true_up, eye)
     m[2, 3] = np.dot(fwd, eye)
+    return m
+
+
+def _frustum(left, right, bottom, top, znear, zfar) -> np.ndarray:
+    """Projection perspective OFF-AXIS (equiv. glFrustum), main droite.
+
+    Autorise un frustum ASYMETRIQUE (left != -right) — requis par la stereo
+    off-axis, qui decale horizontalement le frustum de chaque oeil pour annuler
+    la parallaxe au plan de convergence. Resultat : 4x4 float32 row-major (cf.
+    _mat_bytes pour la transmission a GLSL en column-major)."""
+    rl = (right - left) or 1e-8
+    tb = (top - bottom) or 1e-8
+    fn = (zfar - znear) or 1e-8
+    m = np.zeros((4, 4), dtype=np.float32)
+    m[0, 0] = (2.0 * znear) / rl
+    m[0, 2] = (right + left) / rl
+    m[1, 1] = (2.0 * znear) / tb
+    m[1, 2] = (top + bottom) / tb
+    m[2, 2] = -(zfar + znear) / fn
+    m[2, 3] = -(2.0 * zfar * znear) / fn
+    m[3, 2] = -1.0
     return m
 
 
@@ -212,8 +235,13 @@ class Renderer:
         self._build_framebuffers()
 
         # --- Matrices camera (initialisees, mises a jour par update_camera) --
+        # Parametres de projection PARTAGES par le rendu mono ET stereo.
+        self._cam_fovy = 45.0
+        self._cam_near = 0.05
+        self._cam_far = 100.0
         self._view = np.eye(4, dtype=np.float32)
-        self._proj = _perspective(45.0, self._aspect(), 0.05, 100.0)
+        self._proj = _perspective(self._cam_fovy, self._aspect(),
+                                  self._cam_near, self._cam_far)
         self._view_proj = self._proj @ self._view
 
         # Distance de base de la camera : cadre le papillon de Lorenz (demi-extent
@@ -222,6 +250,19 @@ class Renderer:
         # Etat lisse du zoom reactif (evite les a-coups image a image).
         self._zoom_env = 0.0
         self._shake_env = 0.0
+
+        # --- STEREOSCOPIE (off-axis, axes paralleles) — desactivee par defaut -
+        # Rendu MONO normal sauf si enable_stereo() est appele (par l'Integrator
+        # en mode 3D). IOD = ecart inter-oculaire en unites MONDE ; convergence =
+        # distance oeil->cible * stereo_convergence_scale (suit donc le zoom). On
+        # memorise l'etat camera (rig central) a chaque update_camera pour deriver
+        # les deux frustums sans refaire le calcul d'orbite.
+        self.stereo_enabled = False
+        self.stereo_iod = 0.22
+        self.stereo_convergence_scale = 1.0
+        self._cam_eye = np.array([0.0, 0.0, self._cam_base_dist], dtype=np.float32)
+        self._cam_target = np.zeros(3, dtype=np.float32)
+        self._cam_up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
     # ====================================================================== #
     #  Construction / reconstruction des framebuffers                        #
@@ -339,6 +380,21 @@ class Renderer:
         ("fixed"/"auto"/"beat") ; un nom inconnu retombe sur "beat"."""
         self.camera_mode = self._CAMERA_MODE_ALIASES.get(str(mode).lower(), "beat")
 
+    def enable_stereo(self, enabled=True, iod=None, convergence_scale=None):
+        """Active/regle le rendu STEREO off-axis (relief reel). Sans effet sur le
+        chemin mono tant que l'Integrator n'appelle pas render(eye=-1/+1).
+
+        :param enabled:           True -> l'Integrator dessinera les deux yeux.
+        :param iod:               ecart inter-oculaire (unites MONDE) ; + grand = + de relief.
+        :param convergence_scale: multiplie la distance oeil->cible pour placer le
+                                  plan a PARALLAXE NULLE ( <1 = le nuage 'sort' de
+                                  l'ecran, >1 = il s'enfonce derriere)."""
+        self.stereo_enabled = bool(enabled)
+        if iod is not None:
+            self.stereo_iod = max(0.0, float(iod))
+        if convergence_scale is not None:
+            self.stereo_convergence_scale = max(1e-3, float(convergence_scale))
+
     def update_camera(self, t, features):
         """Met a jour les matrices vue/projection a partir du temps et de l'audio.
 
@@ -421,17 +477,68 @@ class Renderer:
         target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
+        # Memorise l'etat camera (rig central) pour deriver les frustums STEREO.
+        self._cam_eye = eye
+        self._cam_target = target
+        self._cam_up = up
         self._view = _look_at(eye, target, up)
-        self._proj = _perspective(45.0, self._aspect(), 0.05, 100.0)
+        self._proj = _perspective(self._cam_fovy, self._aspect(),
+                                  self._cam_near, self._cam_far)
         # view_proj = projection * vue (applique a une position monde homogene).
         self._view_proj = self._proj @ self._view
+
+    def _eye_view_proj(self, eye_sign):
+        """view_proj OFF-AXIS d'un oeil. eye_sign = -1 (gauche) / +1 (droit).
+
+        STEREO geometriquement correcte (methode de Bourke) : les deux cameras
+        gardent des axes PARALLELES (pas de toe-in, qui introduirait une parallaxe
+        VERTICALE inconfortable) ; tout le relief vient d'un frustum ASYMETRIQUE
+        decale horizontalement pour annuler la parallaxe au plan de CONVERGENCE.
+        L'oeil est decale lateralement de +/- IOD/2 le long du vecteur 'droite'
+        camera. Convergence = distance oeil->cible * stereo_convergence_scale.
+        """
+        eye = self._cam_eye
+        target = self._cam_target
+        up = self._cam_up
+
+        fwd = target - eye
+        fwd = fwd / (np.linalg.norm(fwd) + 1e-8)
+        cam_right = np.cross(fwd, up)
+        cam_right = cam_right / (np.linalg.norm(cam_right) + 1e-8)
+
+        iod = float(self.stereo_iod)
+        convergence = max(1e-3, float(np.linalg.norm(target - eye))
+                          * self.stereo_convergence_scale)
+
+        # Oeil decale lateralement ; regard PARALLELE (eye_pos -> eye_pos + fwd).
+        eye_pos = eye + cam_right * (eye_sign * 0.5 * iod)
+        view = _look_at(eye_pos, eye_pos + fwd, up)
+
+        # Frustum asymetrique : demi-hauteur au near = near*tan(fovy/2) ; le
+        # decalage horizontal compense le decalage d'oeil (parallaxe nulle a la
+        # convergence). Oeil gauche (-1) -> frustum vers +x ; droit (+1) -> -x.
+        near = self._cam_near
+        far = self._cam_far
+        wd2 = near * math.tan(math.radians(self._cam_fovy) * 0.5)
+        aspect = self._aspect()
+        ndfl = near / convergence
+        shift = -eye_sign * 0.5 * iod * ndfl
+        left = -aspect * wd2 + shift
+        right = aspect * wd2 + shift
+        proj = _frustum(left, right, -wd2, wd2, near, far)
+        return proj @ view
 
     # ====================================================================== #
     #  Rendu                                                                 #
     # ====================================================================== #
-    def render(self) -> "moderngl.Texture":
+    def render(self, eye=0) -> "moderngl.Texture":
         """Dessine les N particules dans le FBO HDR, resout le MSAA, et renvoie
         la texture couleur RGBA16F simple-echantillon (consommee par PostFX).
+
+        :param eye: 0 = MONO (frustum symetrique) ; -1 / +1 = oeil GAUCHE / DROIT
+                    en projection OFF-AXIS (stereo). Les buffers de particules sont
+                    IDENTIQUES pour les deux yeux (une seule simulation) : seule la
+                    matrice camera change -> on dessine le meme nuage deux fois.
 
         Etat GL pose ici (et restaure en sortie pour ne rien casser en aval) :
           * Viewport = resolution de rendu.
@@ -445,10 +552,11 @@ class Renderer:
         ctx = self.ctx
 
         # --- Transmission de la matrice camera et de la taille de point ------
-        # (uniforms du programme particule). On serialise la matrice en
-        # column-major (cf. _mat_bytes).
+        # (uniforms du programme particule). MONO -> view_proj symetrique ;
+        # STEREO -> view_proj off-axis de l'oeil. Serialise en column-major.
+        view_proj = self._view_proj if eye == 0 else self._eye_view_proj(eye)
         if "u_view_proj" in self.program:
-            self.program["u_view_proj"].write(_mat_bytes(self._view_proj))
+            self.program["u_view_proj"].write(_mat_bytes(view_proj))
         if "u_point_size" in self.program:
             self.program["u_point_size"].value = self.point_size
 
@@ -502,7 +610,8 @@ class Renderer:
         self._build_framebuffers()
         # Met a jour la matrice de projection (aspect) immediatement ; la vue
         # sera rafraichie au prochain update_camera.
-        self._proj = _perspective(45.0, self._aspect(), 0.05, 100.0)
+        self._proj = _perspective(self._cam_fovy, self._aspect(),
+                                  self._cam_near, self._cam_far)
         self._view_proj = self._proj @ self._view
 
     # ====================================================================== #

@@ -101,6 +101,29 @@ MSAA_SAMPLES = 2
 VSYNC = _CFG["VSYNC"]
 
 
+# --- 3D STÉRÉOSCOPIQUE (relief réel, frame packing 1080p) --------------------
+# Vraie stéréoscopie : la MÊME simulation est rendue depuis DEUX caméras off-axis
+# (axes parallèles + frustums asymétriques -> parallaxe nulle au plan de
+# convergence ; PAS de faux-3D reprojeté). Les deux yeux sont empaquetés au format
+# FRAME PACKING 1080p de la HDMI 1.4a : œil gauche (haut) | 45 lignes d'« active
+# space » | œil droit (bas) = 1920x2205, présenté à 24 Hz. Cf. stereo.py.
+STEREO_3D = _CFG["STEREO_3D"]              # master : active le rendu/empaquetage stéréo
+STEREO_EYE_SEP = _CFG["STEREO_EYE_SEP"]    # écart inter-oculaire (unités MONDE) ; + grand = + de relief
+STEREO_CONVERGENCE = _CFG["STEREO_CONVERGENCE"]  # ×(distance œil->cible) du plan à parallaxe nulle
+STEREO_SWAP_EYES = _CFG["STEREO_SWAP_EYES"]      # inverse G/D (confort / matériel à canaux inversés)
+
+# Géométrie EXACTE du frame packing 1080p (HDMI 1.4a). NE PAS modifier : c'est le
+# standard (1080 + 45 lignes d'intervalle de garde + 1080).
+_FP_EYE_W = 1920
+_FP_EYE_H = 1080
+_FP_GAP = 45
+_FP_TOTAL_H = _FP_EYE_H + _FP_GAP + _FP_EYE_H   # 2205
+_FP_FPS = 24
+# Taille d'APERÇU (fenêtré, portrait ~moitié) du mode 3D avant le plein écran sur
+# l'afficheur 3D. Fenêtre DÉPLAÇABLE ; la géométrie EXACTE vient du plein écran (F).
+_FP_PREVIEW = (960, 1040)
+
+
 # --- POST-TRAITEMENT (look cinématographique) --------------------------------
 ENABLE_BLOOM = _CFG["ENABLE_BLOOM"]               # OFF : pas de halo d'agrégation -> chaque particule nette
 ENABLE_MOTION_BLUR = _CFG["ENABLE_MOTION_BLUR"]   # OFF : pas de traînée -> particules nettes, distinctes
@@ -200,6 +223,14 @@ class _WindowConfig:
         self.msaa = MSAA_SAMPLES
         self.vsync = VSYNC
         self.title = "Sythm — Visualiseur audio GPU (RTX 4090)"
+        # STÉRÉO : fenêtre DÉPLAÇABLE (décorée, redimensionnable) au format portrait
+        # du frame packing. On NE fige PAS la géométrie et on NE force PAS le plein
+        # écran : l'utilisateur glisse la fenêtre sur son afficheur/projecteur 3D
+        # puis appuie sur F -> plein écran EXACT sur CE moniteur (1920x2205 en mode
+        # frame packing) -> empaquetage pixel-exact. Taille d'aperçu portrait.
+        if STEREO_3D:
+            self.width, self.height = _FP_PREVIEW
+            self.fullscreen = False
 
 
 def _compute_render_resolution(screen_w, screen_h):
@@ -307,14 +338,16 @@ WARMUP_FRAMES = 16
 WARMUP_MAX_SECONDS = 0.8
 
 
-def _warmup(window, ctx, particles, renderer, postfx):
-    """Exécute le pipeline COMPLET (sim -> rendu HDR -> post-FX) quelques frames
-    AVANT la boucle visible, HORS-ÉCRAN (aucun swap), puis force la fin du travail
-    GPU. On paie ICI (bref instant noir) ce qui rendait les premières frames vues
-    lentes : finalisation des pipelines GL au 1er draw de millions de points, 1ers
-    passes post-FX, montée du pool mémoire cupy et des horloges GPU. La 1re frame
-    VISIBLE est alors déjà « chaude ». Borné par WARMUP_FRAMES / WARMUP_MAX_SECONDS.
-    Tout échec est avalé : la préchauffe est un bonus, jamais bloquante."""
+def _warmup(window, ctx, particles, renderer, present_frame):
+    """Exécute le pipeline COMPLET (sim -> rendu HDR -> post-FX, mono OU stéréo)
+    quelques frames AVANT la boucle visible, HORS-ÉCRAN (aucun swap), puis force la
+    fin du travail GPU. On paie ICI (bref instant noir) ce qui rendait les premières
+    frames vues lentes : finalisation des pipelines GL au 1er draw de millions de
+    points, 1ers passes post-FX, montée du pool mémoire cupy et des horloges GPU. La
+    1re frame VISIBLE est alors déjà « chaude ». `present_frame` dessine une frame
+    complète (mono : post-FX plein écran ; stéréo : empaquetage frame packing des
+    deux yeux). Borné par WARMUP_FRAMES / WARMUP_MAX_SECONDS. Tout échec est avalé :
+    la préchauffe est un bonus, jamais bloquante."""
     try:
         dt = 1.0 / 60.0
         t0 = time.perf_counter()
@@ -322,8 +355,7 @@ def _warmup(window, ctx, particles, renderer, postfx):
         while n < WARMUP_FRAMES and (time.perf_counter() - t0) < WARMUP_MAX_SECONDS:
             particles.update(dt, None)
             renderer.update_camera(n * dt, None)
-            hdr = renderer.render()
-            postfx.process(hdr, ctx.screen)
+            present_frame()             # rendu COMPLET (mono ou stéréo), hors-écran
             window.poll_events()        # garde la fenêtre réactive (pas « ne répond pas »)
             n += 1
         # Pré-remplit le ring des traînées -> densité de RÉGIME dès la 1re frame vue
@@ -333,7 +365,7 @@ def _warmup(window, ctx, particles, renderer, postfx):
             particles.prefill_emitted()
             particles.update(dt, None)              # écrit l'état pré-rempli dans les buffers GL
             renderer.update_camera(n * dt, None)
-            postfx.process(renderer.render(), ctx.screen)
+            present_frame()
             window.poll_events()
         # Force la fin de TOUT le travail GPU différé MAINTENANT (pas en frame 1).
         try:
@@ -449,8 +481,14 @@ def _run_session():
         ctx = window.ctx
         screen_w, screen_h = window.size
 
-        # Résolution de rendu interne (supersamplée), bornée pour la sécurité.
-        render_w, render_h, ss_eff = _compute_render_resolution(screen_w, screen_h)
+        # Mode 3D stéréoscopique (frame packing) : rendu PAR ŒIL à 1920x1080 natif
+        # (pas de supersampling -> coût borné pour 2 yeux @ 24 Hz), empaqueté ensuite
+        # en 1920x2205. Sinon, résolution interne (supersamplée) habituelle.
+        stereo = bool(STEREO_3D)
+        if stereo:
+            render_w, render_h, ss_eff = _FP_EYE_W, _FP_EYE_H, 1.0
+        else:
+            render_w, render_h, ss_eff = _compute_render_resolution(screen_w, screen_h)
 
         # Comptes : origines (advectées) + émises (traînées éphémères, ring buffer).
         n_origin = N_PARTICLES
@@ -492,6 +530,12 @@ def _run_session():
         )
         # Taille des particules (px écran) réglée depuis l'en-tête réglable.
         renderer.point_size = float(PARTICLE_SIZE)
+        # Active la STÉRÉO off-axis sur le renderer si la session est en 3D : les
+        # deux yeux partageront ces mêmes buffers (une seule simulation), rendus via
+        # renderer.render(eye=-1/+1) depuis deux frustums asymétriques.
+        if stereo and hasattr(renderer, "enable_stereo"):
+            renderer.enable_stereo(True, iod=STEREO_EYE_SEP,
+                                   convergence_scale=STEREO_CONVERGENCE)
 
         # =====================================================================
         #  3) PARTICLE SYSTEM  — s'enregistre sur les buffers GL du Renderer
@@ -509,27 +553,46 @@ def _run_session():
         # =====================================================================
         #  4) POST-PROCESSOR  — bloom / motion blur / tonemapping -> écran
         # =====================================================================
-        postfx = PostProcessor(
-            ctx,
-            render_w,
-            render_h,
-            screen_w,
-            screen_h,
-            enable_bloom=ENABLE_BLOOM,
-            enable_motion_blur=ENABLE_MOTION_BLUR,
-            exposure=EXPOSURE,
-        )
-        # Paramètres affinés (intensités/seuils) si le PostProcessor les accepte.
-        _safe_set_params(
-            postfx,
-            bloom_intensity=BLOOM_INTENSITY,
-            bloom_threshold=BLOOM_THRESHOLD,
-            motion_blur_strength=MOTION_BLUR_STRENGTH,
-            exposure=EXPOSURE,
-            enable_denoise=ENABLE_DENOISE,
-            denoise_sigma=DENOISE_SIGMA,
-            denoise_iters=DENOISE_ITERS,
-        )
+        # Fabrique d'une chaîne post-FX (réglages affinés appliqués), réutilisée :
+        # une fois en mono (plein écran), deux fois en stéréo (un œil chacune ->
+        # historiques motion-blur SÉPARÉS, pas de fantôme inter-yeux).
+        def _build_postfx(scr_w, scr_h):
+            p = PostProcessor(
+                ctx, render_w, render_h, scr_w, scr_h,
+                enable_bloom=ENABLE_BLOOM,
+                enable_motion_blur=ENABLE_MOTION_BLUR,
+                exposure=EXPOSURE,
+            )
+            _safe_set_params(
+                p,
+                bloom_intensity=BLOOM_INTENSITY,
+                bloom_threshold=BLOOM_THRESHOLD,
+                motion_blur_strength=MOTION_BLUR_STRENGTH,
+                exposure=EXPOSURE,
+                enable_denoise=ENABLE_DENOISE,
+                denoise_sigma=DENOISE_SIGMA,
+                denoise_iters=DENOISE_ITERS,
+            )
+            return p
+
+        if stereo:
+            # StereoRig : deux chaînes 1920x1080 (render = screen, pas de downscale)
+            # empaquetées en frame packing 1920x2205. Expose set_params/release ->
+            # interchangeable avec PostProcessor pour les toggles et le nettoyage.
+            from stereo import StereoRig
+            postfx = StereoRig(ctx, renderer,
+                               lambda: _build_postfx(render_w, render_h),
+                               swap_eyes=STEREO_SWAP_EYES)
+            print(f"[main] Mode 3D STÉRÉOSCOPIQUE — frame packing "
+                  f"{_FP_EYE_W}x{_FP_TOTAL_H}@{_FP_FPS} (œil {_FP_EYE_W}x{_FP_EYE_H} + "
+                  f"{_FP_GAP} lignes de garde + œil {_FP_EYE_W}x{_FP_EYE_H}) | "
+                  f"IOD={STEREO_EYE_SEP}, conv x{STEREO_CONVERGENCE}"
+                  f"{', G/D inversés' if STEREO_SWAP_EYES else ''}.", file=sys.stderr)
+            print("[main] 3D : glisse la fenêtre sur ton afficheur/projecteur 3D, "
+                  "puis F -> plein écran pixel-exact. ESC revient aux réglages.",
+                  file=sys.stderr)
+        else:
+            postfx = _build_postfx(screen_w, screen_h)
 
         # =====================================================================
         #  5) AUDIO ENGINE  — démarre le thread de capture loopback + FFT GPU
@@ -559,12 +622,23 @@ def _run_session():
 
         _print_controls()
 
+        # Fermeture de rendu d'UNE frame complète (mono ou stéréo), réutilisée par
+        # la préchauffe ET la boucle. NE fait PAS update_camera (l'appelant le fait
+        # avec le bon temps t). Mono -> post-FX plein écran ; stéréo -> empaquetage
+        # frame packing des deux yeux dans le framebuffer par défaut (window.size).
+        if stereo:
+            def _present_frame():
+                postfx.render_frame(ctx.screen, *window.size)
+        else:
+            def _present_frame():
+                postfx.process(renderer.render(), ctx.screen)
+
         # =====================================================================
         #  PRÉCHAUFFE — avant la boucle visible : on absorbe ICI le vrai warmup
         #  GPU (1er draw de millions de points, 1ers post-FX, pool cupy, horloges)
         #  en rendant hors-écran, pour que la 1re frame VUE soit déjà chaude.
         # =====================================================================
-        _warmup(window, ctx, particles, renderer, postfx)
+        _warmup(window, ctx, particles, renderer, _present_frame)
 
         # =====================================================================
         #  BOUCLE PRINCIPALE
@@ -584,7 +658,11 @@ def _run_session():
             # F : plein écran borderless (change la taille -> resize géré juste après).
             if loop_state.toggle_fullscreen:
                 loop_state.toggle_fullscreen = False
-                window.toggle_fullscreen()
+                # F : plein écran borderless sur le moniteur SOUS la fenêtre. En 3D,
+                # couverture EXACTE (exact=True) -> sur un afficheur en frame packing
+                # 1920x2205 le framebuffer fait pile cette taille -> empaquetage
+                # pixel-exact. En mono, débordement 1px habituel (HDR préservé).
+                window.toggle_fullscreen(exact=stereo)
             # R : démarre / arrête l'enregistrement HEVC (x265/NVENC).
             if loop_state.toggle_record:
                 loop_state.toggle_record = False
@@ -634,8 +712,9 @@ def _run_session():
                         print(f"[record] ⚠ ffmpeg : {rec.last_error}",
                               file=sys.stderr)
 
-            # --- Redimensionnement éventuel (fenêtré) ------------------------
-            if window.resized:
+            # --- Redimensionnement éventuel (fenêtré ; jamais en 3D figée) ----
+            _resized = window.resized            # lecture consommatrice du drapeau
+            if _resized and not stereo:
                 new_w, new_h = window.size
                 r_w, r_h, _ = _compute_render_resolution(new_w, new_h)
                 renderer.resize(r_w, r_h)
@@ -650,12 +729,11 @@ def _run_session():
             # --- 2) Simulation des particules (CUDA écrit dans les buffers GL)
             particles.update(dt, features)
 
-            # --- 3) Caméra + rendu HDR offscreen -----------------------------
+            # --- 3+4) Caméra + rendu + post-traitement -> framebuffer écran --
+            # Mono : 1 rendu HDR -> post-FX plein écran. Stéréo : 2 rendus off-axis
+            # (un par œil) empaquetés en frame packing (cf. _present_frame).
             renderer.update_camera(t, features)
-            hdr_tex = renderer.render()
-
-            # --- 4) Post-traitement -> framebuffer écran ---------------------
-            postfx.process(hdr_tex, ctx.screen)
+            _present_frame()
 
             # --- 4b) Capture vidéo (si enregistrement actif), AVANT le swap ---
             if loop_state.recorder is not None:
@@ -669,8 +747,9 @@ def _run_session():
             if fps.should_refresh_title(now):
                 _update_title(window, fps.value, loop_state)
 
-            # Bridage optionnel des FPS (mode non-vsync).
-            _maybe_limit_fps(now)
+            # Bridage des FPS : 24 Hz IMPOSÉ en 3D (cadence frame packing 1080p),
+            # sinon TARGET_FPS optionnel (mode non-vsync).
+            _maybe_limit_fps(now, _FP_FPS if stereo else TARGET_FPS)
 
     except KeyboardInterrupt:
         print("\n[main] Interruption clavier — arrêt.", file=sys.stderr)
@@ -791,17 +870,21 @@ def _update_title(window, fps_value, state):
     mblur = "M" if state.enable_motion_blur else "-"
     rec = "  ● REC" if getattr(state, "recorder", None) is not None else ""
     fs = "FS " if getattr(window, "is_fullscreen", False) else ""
+    d3 = "3D " if STEREO_3D else ""
     title = (f"Sythm | {fps_value:5.1f} FPS | {N_PARTICLES:,} part. | "
-             f"[{bloom}{mblur}] {fs}cam:{state.camera_mode}{rec}")
+             f"[{bloom}{mblur}] {d3}{fs}cam:{state.camera_mode}{rec}")
     if getattr(window, "handle", None) is not None:
         glfw.set_window_title(window.handle, title)
 
 
-def _maybe_limit_fps(frame_start):
-    """Bride le framerate si TARGET_FPS est défini (mode non-vsync)."""
-    if TARGET_FPS is None or TARGET_FPS <= 0:
+def _maybe_limit_fps(frame_start, target_fps):
+    """Bride le framerate à `target_fps` (None/<=0 = pas de bridage).
+
+    Sert à IMPOSER 24 Hz en 3D (cadence frame packing 1080p) et à appliquer
+    TARGET_FPS en mono non-vsync."""
+    if target_fps is None or target_fps <= 0:
         return
-    target_dt = 1.0 / float(TARGET_FPS)
+    target_dt = 1.0 / float(target_fps)
     elapsed = time.perf_counter() - frame_start
     remaining = target_dt - elapsed
     if remaining > 0:

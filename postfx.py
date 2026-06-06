@@ -518,13 +518,19 @@ class PostProcessor:
     # ------------------------------------------------------------------ #
     #  Boucle principale de post-traitement                               #
     # ------------------------------------------------------------------ #
-    def process(self, hdr_texture, target_framebuffer):
+    def process(self, hdr_texture, target_framebuffer, viewport=None):
         """Applique toute la chaine post-FX.
 
         hdr_texture       : moderngl.Texture RGBA16F (HDR lineaire, pre-tonemap)
                             a la resolution de RENDU (fournie par renderer.py).
         target_framebuffer: framebuffer ecran/par-defaut ou dessiner l'image
                             finale SDR (fourni par l'integrateur).
+        viewport          : (x, y, w, h) optionnel. Si fourni, l'image FINALE est
+                            composee dans CE sous-rectangle de target_framebuffer
+                            (origine GL en bas-gauche) au lieu du plein ecran.
+                            Sert au mode STEREO (frame packing) : on compose l'oeil
+                            gauche en haut et l'oeil droit en bas du MEME
+                            framebuffer. Defaut None -> plein ecran (mono, inchange).
         """
         if self.ctx is None or moderngl is None:
             return  # garde « sans GPU »
@@ -575,7 +581,10 @@ class PostProcessor:
         # viewport périmé du framebuffer par défaut et l'image resterait dessinée
         # dans l'ancien coin, aux anciennes dimensions.
         try:
-            target_framebuffer.viewport = (0, 0, self.screen_width, self.screen_height)
+            if viewport is not None:
+                target_framebuffer.viewport = tuple(viewport)
+            else:
+                target_framebuffer.viewport = (0, 0, self.screen_width, self.screen_height)
         except Exception:
             pass
 
