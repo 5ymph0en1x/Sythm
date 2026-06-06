@@ -846,6 +846,34 @@ class ParticleSystem:
         self._gl_col_buffer.write(cp.asnumpy(self._fallback_col))
 
     # ------------------------------------------------------------- release
+    def prefill_emitted(self):
+        """Pré-remplit le ring des traînées avec un ÂGE uniformément réparti sur
+        [0, lifetime) pour que leur densité soit à son RÉGIME dès la 1re frame —
+        sinon elle met EMITTED_LIFETIME secondes à se peupler (18 s en Ambiant,
+        24 s en Cosmique), d'où le « chargement » visible à l'ouverture.
+
+        Modèle balistique (pos = origine + vitesse·âge) + fondu (1-u)^2 : les jeunes
+        (vives, près des origines) remplissent la boîte, les vieilles (déjà éteintes
+        par le fondu) sont invisibles -> remplissage SANS couture. À appeler APRÈS
+        >=1 update() (les origines doivent déjà avoir une vitesse). One-shot."""
+        if self.n_emit <= 0:
+            return
+        try:
+            with self._stream:
+                es = self.emit_state.reshape(self.n_emit, 7)
+                opos = self.pos_state.reshape(self.n_origin, 3)
+                ovel = self.vel_state.reshape(self.n_origin, 3)
+                # Même balayage des origines que le kernel d'émission : slot % n_origin.
+                src = cp.arange(self.n_emit, dtype=cp.int32) % self.n_origin
+                ages = cp.random.random(self.n_emit, dtype=cp.float32) * np.float32(self.lifetime)
+                es[:, 0:3] = opos[src] + ovel[src] * ages[:, None]   # position balistique à cet âge
+                es[:, 3:6] = ovel[src]                                # vitesse héritée de l'origine
+                es[:, 6] = ages                                       # âge réparti -> densité de régime
+            self._stream.synchronize()
+        except Exception as exc:
+            print(f"[particles] pré-remplissage des traînées ignoré ({exc}).",
+                  file=sys.stderr)
+
     def release(self):
         try:
             if self._stream is not None: self._stream.synchronize()

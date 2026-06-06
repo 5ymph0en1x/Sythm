@@ -299,38 +299,122 @@ def _max_total_particles(n_origin, render_w, render_h, msaa):
     return int(max(1, min(cap_int32, cap_vram)))
 
 
-def main():
-    """Point d'entrée : construit tout, fait tourner la boucle, nettoie."""
+# Préchauffe : nb de frames et plafond de temps. Quelques frames suffisent à
+# finaliser les pipelines GL/post-FX et à grossir le pool mémoire cupy ; la
+# fenêtre de temps laisse les horloges GPU monter, tout en bornant la durée sur
+# une carte modeste (chaque frame de préchauffe y étant plus lente).
+WARMUP_FRAMES = 16
+WARMUP_MAX_SECONDS = 0.8
 
-    # ----- FENÊTRE DE CONFIGURATION (au lancement, AVANT le moteur GPU) -------
-    # Ouvre une fenêtre thémée (TKinterModernThemes / park / dark) pour régler les
-    # paramètres sans toucher au code, puis applique les choix. run_config() rend :
-    #   dict  -> on lance avec ces réglages ; None -> annulé (on ferme) ;
-    #   False -> UI indisponible (tkinter/lib absent) -> on continue avec les défauts.
-    cfg, _MAIN_KEYS, _PARTICLE_KEYS = False, [], []
+
+def _warmup(window, ctx, particles, renderer, postfx):
+    """Exécute le pipeline COMPLET (sim -> rendu HDR -> post-FX) quelques frames
+    AVANT la boucle visible, HORS-ÉCRAN (aucun swap), puis force la fin du travail
+    GPU. On paie ICI (bref instant noir) ce qui rendait les premières frames vues
+    lentes : finalisation des pipelines GL au 1er draw de millions de points, 1ers
+    passes post-FX, montée du pool mémoire cupy et des horloges GPU. La 1re frame
+    VISIBLE est alors déjà « chaude ». Borné par WARMUP_FRAMES / WARMUP_MAX_SECONDS.
+    Tout échec est avalé : la préchauffe est un bonus, jamais bloquante."""
+    try:
+        dt = 1.0 / 60.0
+        t0 = time.perf_counter()
+        n = 0
+        while n < WARMUP_FRAMES and (time.perf_counter() - t0) < WARMUP_MAX_SECONDS:
+            particles.update(dt, None)
+            renderer.update_camera(n * dt, None)
+            hdr = renderer.render()
+            postfx.process(hdr, ctx.screen)
+            window.poll_events()        # garde la fenêtre réactive (pas « ne répond pas »)
+            n += 1
+        # Pré-remplit le ring des traînées -> densité de RÉGIME dès la 1re frame vue
+        # (sinon elle met EMITTED_LIFETIME s à se peupler : 18 s en Ambiant, 24 s en
+        # Cosmique). Les origines ont une vitesse, établie par les updates ci-dessus.
+        if hasattr(particles, "prefill_emitted"):
+            particles.prefill_emitted()
+            particles.update(dt, None)              # écrit l'état pré-rempli dans les buffers GL
+            renderer.update_camera(n * dt, None)
+            postfx.process(renderer.render(), ctx.screen)
+            window.poll_events()
+        # Force la fin de TOUT le travail GPU différé MAINTENANT (pas en frame 1).
+        try:
+            import cupy as cp
+            cp.cuda.Device().synchronize()
+        except Exception:
+            pass
+        try:
+            ctx.finish()
+        except Exception:
+            pass
+        print(f"[main] Préchauffe : {n} frames en {time.perf_counter() - t0:.2f}s "
+              f"(pipelines GL + pool cupy + horloges).", file=sys.stderr)
+    except Exception as exc:
+        print(f"[main] Préchauffe ignorée ({exc}).", file=sys.stderr)
+
+
+def main():
+    """Point d'entrée : BOUCLE « réglages -> simulation -> réglages ».
+
+    La simulation ne QUITTE jamais le programme : l'arrêt en plein run (ESC ou
+    croix de la fenêtre) REVIENT à l'écran de configuration, prêt à relancer
+    aussitôt. On ne quitte VRAIMENT que depuis cette fenêtre (la fermer / l'annuler).
+    """
+    # Import (léger : os/sys/json) de la fenêtre de config. Différé pour que
+    # py_compile et les outils statiques marchent même sans la lib d'UI.
+    run_config = None
+    _MAIN_KEYS, _PARTICLE_KEYS = [], []
     try:
         from config_window import (run_config,
                                     MAIN_KEYS as _MAIN_KEYS,
                                     PARTICLE_KEYS as _PARTICLE_KEYS)
-        cfg = run_config()
     except Exception as exc:
         print(f"[main] Fenêtre de config indisponible ({exc}) -> défauts.",
               file=sys.stderr)
-        cfg = False
-    if cfg is None:
-        print("[main] Configuration annulée — fermeture.", file=sys.stderr)
-        return 0
-    if cfg:                                  # dict -> applique les clés « main.py »
-        _g = globals()
-        for _k in _MAIN_KEYS:
-            if _k in cfg:
-                _g[_k] = cfg[_k]
+        run_config = None
 
-    # ----- Imports « lourds » différés ---------------------------------------
-    # On importe ici (et non en tête de module) pour que `python -m py_compile`
-    # et les outils statiques restent fonctionnels même si les dépendances GPU
-    # (moderngl, cupy, glfw, soundcard...) ne sont pas installées sur la machine
-    # de développement. L'échec d'import est alors signalé clairement à l'exécution.
+    while True:
+        # ----- 1) FENÊTRE DE CONFIGURATION (thémée TKinterModernThemes) -------
+        #   dict  -> lancer avec ces réglages ; None -> fermée (on QUITTE) ;
+        #   False -> UI indisponible/HS -> une seule session avec les défauts.
+        cfg = run_config() if run_config is not None else False
+        if cfg is None:
+            print("[main] Configuration fermée — au revoir.", file=sys.stderr)
+            return 0
+        can_return = cfg is not False          # un dict => UI OK => on pourra revenir
+        if cfg:                                 # applique les réglages choisis
+            _g = globals()
+            for _k in _MAIN_KEYS:
+                if _k in cfg:
+                    _g[_k] = cfg[_k]
+            import particles as _pmod           # clés « _ » -> module particles
+            for _k in _PARTICLE_KEYS:
+                if _k in cfg:
+                    setattr(_pmod, _k, cfg[_k])
+
+        # ----- 2) SIMULATION — revient quand la fenêtre est fermée -----------
+        if not _run_session():
+            return 1                            # dépendances GPU manquantes
+
+        # ----- 3) RETOUR AUX RÉGLAGES ----------------------------------------
+        # Sans UI de config exploitable, impossible d'y revenir -> on quitte après
+        # cette session unique (sinon on rejouerait en boucle infinie).
+        if not can_return:
+            return 0
+        print("[main] Simulation arrêtée — retour aux réglages.", file=sys.stderr)
+
+
+def _run_session():
+    """Construit le moteur, fait tourner la boucle de rendu, puis NETTOIE TOUT
+    (ordre inverse de construction) pour que la session suivante reparte d'un état
+    propre : GLFW est ré-initialisable (Window.close() fait glfw.terminate()), le
+    contexte GL/CUDA et le thread audio sont libérés. Revient à main() quand la
+    fenêtre se ferme.
+
+    Renvoie False si les dépendances GPU manquent (rien n'a démarré), True sinon
+    (session menée à son terme puis nettoyée — y compris après une erreur attrapée).
+    """
+    # Imports « lourds » différés (cachés après le 1er appel) — gardés hors du
+    # module pour que py_compile/outils statiques marchent même sans les libs GPU
+    # (moderngl, cupy, glfw, soundcard...).
     try:
         from window import Window
         from renderer import Renderer
@@ -346,16 +430,7 @@ def main():
               " (moderngl, glfw, cupy, soundcard...) sont installées :",
               file=sys.stderr)
         print("           uv pip install -r requirements.txt", file=sys.stderr)
-        return 1
-
-    # Applique les réglages « particles.py » (constantes à préfixe _) choisis dans
-    # la fenêtre de config — lues au moment de l'update, donc un override par
-    # setattr AVANT de construire le ParticleSystem suffit.
-    if cfg:
-        import particles as _pmod
-        for _k in _PARTICLE_KEYS:
-            if _k in cfg:
-                setattr(_pmod, _k, cfg[_k])
+        return False
 
     # Références déclarées à None pour un nettoyage sûr dans le finally même si
     # une étape de construction échoue à mi-chemin.
@@ -483,6 +558,13 @@ def main():
             renderer.set_camera_mode(CAMERA_MODE)
 
         _print_controls()
+
+        # =====================================================================
+        #  PRÉCHAUFFE — avant la boucle visible : on absorbe ICI le vrai warmup
+        #  GPU (1er draw de millions de points, 1ers post-FX, pool cupy, horloges)
+        #  en rendant hors-écran, pour que la 1re frame VUE soit déjà chaude.
+        # =====================================================================
+        _warmup(window, ctx, particles, renderer, postfx)
 
         # =====================================================================
         #  BOUCLE PRINCIPALE
@@ -616,7 +698,7 @@ def main():
                    "window.close()")
         print("[main] Terminé.", file=sys.stderr)
 
-    return 0
+    return True
 
 
 # -----------------------------------------------------------------------------

@@ -425,6 +425,17 @@ def run_config(_test_build_only: bool = False):
         print(f"[config] UI indisponible ({exc}) -> valeurs par défaut.", file=sys.stderr)
         return False
 
+    # BOUCLE config<->session : TKMT n'ouvre un vrai `tk.Tk()` que pour SA toute
+    # première fenêtre du process (singleton de module `firstWindow`), puis des
+    # `tk.Toplevel()`. Or on DÉTRUIT le root entre deux sessions -> au 2e appel,
+    # le Toplevel n'aurait plus de root vivant et Tkinter en forgerait un par
+    # défaut (fenêtre grise vide titrée « tk »). On force donc un `tk.Tk()` NEUF
+    # à chaque appel en remettant le singleton à True (no-op au tout premier).
+    try:
+        TKMT.firstWindow = True
+    except Exception:
+        pass
+
     values = dict(DEFAULTS)
     values.update(load_saved())
 
