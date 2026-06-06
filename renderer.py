@@ -183,6 +183,11 @@ class Renderer:
         # Mode camera : "fixed", "auto" (rotation lente), "beat" (auto + reaction
         # subtile au beat/amp). Defaut : "beat" (le plus vivant).
         self.camera_mode = "beat"
+        # Vitesse angulaire d'orbite (rad/s) pour les modes "auto"/"beat". Reglee
+        # par l'Integrator depuis CAMERA_ROTATE_SPEED ; defaut = ~1 tour / 40 s
+        # (= l'ancienne constante codee en dur, valeur historique preservee). 0 =>
+        # orbite immobile en azimut.
+        self.rotate_speed = 2.0 * math.pi / 40.0
         # Palette HDR optionnelle fournie par l'Integrator (USER_COLOR_GRADIENT).
         # Acceptee pour respecter le contrat de construction de main.py et
         # conservee pour un usage futur (teinte globale du nuage). La couleur PAR
@@ -430,8 +435,10 @@ class Renderer:
             angle = 0.0
             elev = 0.18  # leger surplomb fixe
         else:
-            # Rotation lente : ~1 tour toutes les ~40 s. Discrete, hypnotique.
-            angle = t * (2.0 * math.pi / 40.0)
+            # Rotation lente, VITESSE ANGULAIRE REGLABLE (rad/s) : self.rotate_speed
+            # branche depuis CAMERA_ROTATE_SPEED (defaut ~1 tour / 40 s). 0 => azimut
+            # fige (orbite immobile, mais l'elevation respire encore).
+            angle = t * self.rotate_speed
             # Oscillation verticale tres douce de l'elevation.
             elev = 0.18 + 0.10 * math.sin(t * 0.13)
             # HOULE verticale calee sur la MESURE (mode beat, portee par la confiance) :

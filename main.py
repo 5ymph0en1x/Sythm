@@ -530,6 +530,11 @@ def _run_session():
         )
         # Taille des particules (px écran) réglée depuis l'en-tête réglable.
         renderer.point_size = float(PARTICLE_SIZE)
+        # Vitesse angulaire d'orbite (rad/s, modes auto/beat) : branche enfin
+        # CAMERA_ROTATE_SPEED (jusqu'ici lu mais JAMAIS appliqué — l'angle était figé
+        # à ~1 tour/40 s). 0 => orbite immobile en azimut.
+        if hasattr(renderer, "rotate_speed"):
+            renderer.rotate_speed = float(CAMERA_ROTATE_SPEED)
         # Active la STÉRÉO off-axis sur le renderer si la session est en 3D : les
         # deux yeux partageront ces mêmes buffers (une seule simulation), rendus via
         # renderer.render(eye=-1/+1) depuis deux frustums asymétriques.

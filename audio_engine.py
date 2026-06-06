@@ -856,6 +856,10 @@ class AudioEngine:
         # bas niveau visuellement, sans le coût d'un log complet.
         g_spec = cp.sqrt(g_spec + 1e-12)
 
+        # --- DIAPASON : estime l'accordage global et re-centre le repliement chroma
+        #     dessus (invariance au diapason : La=432, vinyle ralenti…). Lent, gardé.
+        self._update_tuning(g_spec)
+
         # --- HARMONIE : chroma 12 classes (réduction diffusée, reste GPU) puis
         #     corrélation aux profils de tonalité (Krumhansl) -> warmth + key_hue.
         g_chroma = cp.sum(self._chroma_matrix_gpu * g_spec[None, :], axis=1)   # (12,)
@@ -1008,16 +1012,38 @@ class AudioEngine:
         edges = np.logspace(np.log10(self.SPECTRUM_FMIN),
                             np.log10(self.SPECTRUM_FMAX), self.N_SPECTRUM + 1)
         centers = np.sqrt(edges[:-1] * edges[1:])
-        # Chroma : chaque bin de la PLAGE HARMONIQUE contribue à sa classe de
-        # hauteur (pc = round(12·log2(f/C0)) % 12). On exclut le très grave et les
-        # aigus (cymbales/bruit) qui brouilleraient l'estimation tonale.
+        # Chroma : chaque bin de la PLAGE HARMONIQUE contribue à sa classe de hauteur
+        # (pc = round(12·log2(f/C0) − τ) % 12, τ = offset de diapason estimé, cf.
+        # _update_tuning). On exclut le très grave et les aigus (cymbales/bruit) qui
+        # brouilleraient l'estimation tonale.
         HARM_FMIN, HARM_FMAX, C0 = 55.0, 2000.0, 16.351597831287414
-        cm = np.zeros((12, self.N_SPECTRUM), dtype=np.float32)
-        for i, f in enumerate(centers):
-            if HARM_FMIN <= f <= HARM_FMAX:
-                pc = int(round(12.0 * np.log2(f / C0))) % 12
-                cm[pc, i] = 1.0
-        self._chroma_matrix_gpu = cp.asarray(cm)
+        self._C0_base = C0
+        # Position réelle (demi-tons, grille A=440) de chaque bin + masque harmonique.
+        self._bin_semitone = 12.0 * np.log2(np.maximum(centers, 1e-6) / C0)
+        self._harm_mask = (centers >= HARM_FMIN) & (centers <= HARM_FMAX)
+        # --- Estimateur de DIAPASON (invariance à l'accordage) -------------------
+        # Écart de chaque bin au demi-ton le plus proche (grille 440), dans [-0.5,0.5[.
+        # La moyenne CIRCULAIRE de ces écarts PONDÉRÉE PAR L'ÉNERGIE donne l'offset de
+        # diapason global (p.ex. −0.318 demi-ton pour un morceau en La=432). On
+        # pré-calcule les phaseurs cos/sin (période = 1 demi-ton) + le masque en VRAM
+        # pour une réduction pondérée quasi gratuite par frame (cf. _update_tuning).
+        _frac = self._bin_semitone - np.round(self._bin_semitone)         # [-0.5, 0.5]
+        _two_pi = 2.0 * np.pi
+        self._tune_cos_gpu = cp.asarray(
+            (np.cos(_two_pi * _frac) * self._harm_mask).astype(np.float32))
+        self._tune_sin_gpu = cp.asarray(
+            (np.sin(_two_pi * _frac) * self._harm_mask).astype(np.float32))
+        self._harm_mask_gpu = cp.asarray(self._harm_mask.astype(np.float32))
+        # Réglages de l'estimateur (le diapason est CONSTANT sur un morceau -> lent).
+        self._TUNE_R_MIN = 0.30      # concentration mini (contenu nettement tonal) pour ajuster
+        self._TUNE_ALPHA = 0.02      # lissage circulaire (lent)
+        self._TUNE_REBUILD = 0.02    # re-replie la chroma si l'offset bouge de >0.02 demi-ton
+        # État du diapason : résultante lissée sur le cercle (angle -> offset demi-tons).
+        self._tune_zr, self._tune_zi = 0.0, 0.0
+        self._tuning_semitones = 0.0
+        self._chroma_tau_applied = 0.0
+        # Matrice chroma initiale (τ = 0 -> grille A=440 standard).
+        self._rebuild_chroma_matrix(0.0)
         # Profils Krumhansl-Schmuckler (poids par classe, clé en 0).
         ks_major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
                              2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
@@ -1040,6 +1066,47 @@ class AudioEngine:
         self._tonal_warmth = 0.0
         self._key_root = 0
         self._key_counter = 0
+
+    def _rebuild_chroma_matrix(self, tau):
+        """(Re)construit la matrice chroma 12xN : chaque bin de la plage harmonique
+        est replié vers sa classe de hauteur la plus proche, sur une grille DÉCALÉE
+        de `tau` demi-tons (l'offset de diapason estimé). tau = 0 => grille A=440."""
+        s = self._bin_semitone
+        pc = np.mod(np.rint(s - tau).astype(np.int64), 12)
+        cm = np.zeros((12, self.N_SPECTRUM), dtype=np.float32)
+        idx = np.where(self._harm_mask)[0]
+        cm[pc[idx], idx] = 1.0
+        self._chroma_matrix_gpu = cp.asarray(cm)
+        self._chroma_tau_applied = float(tau)
+
+    def _update_tuning(self, g_spec):
+        """Estime le DIAPASON global (offset en demi-tons vs A=440) et re-centre le
+        repliement chroma dessus -> reconnaissance tonale INVARIANTE AU DIAPASON
+        (La=432, vinyle légèrement ralenti…) tant que l'écart reste < ~50 cents (un
+        quart de ton ; au-delà, le demi-ton « le plus proche » bascule et l'accordage
+        devient intrinsèquement ambigu — limite de toute méthode chroma).
+
+        Méthode : moyenne CIRCULAIRE, pondérée par l'énergie, des écarts bin->demi-ton
+        le plus proche sur la plage harmonique — l'analogue léger de
+        librosa.estimate_tuning. On regarde TOUT le spectre (pas une crête isolée à
+        440, fragile). Gating par la concentration R (> _TUNE_R_MIN) : on n'ajuste que
+        sur un contenu nettement tonal, jamais sur la percussion/le bruit. Lissé TRÈS
+        lentement (le diapason est constant sur un morceau)."""
+        cw = float(cp.sum(g_spec * self._tune_cos_gpu))
+        sw = float(cp.sum(g_spec * self._tune_sin_gpu))
+        w = float(cp.sum(g_spec * self._harm_mask_gpu)) + 1e-9
+        cw /= w
+        sw /= w
+        R = (cw * cw + sw * sw) ** 0.5                    # concentration 0..1
+        if R > self._TUNE_R_MIN:
+            a = self._TUNE_ALPHA
+            self._tune_zr += a * (cw - self._tune_zr)
+            self._tune_zi += a * (sw - self._tune_zi)
+            self._tuning_semitones = float(
+                np.arctan2(self._tune_zi, self._tune_zr)) / (2.0 * np.pi)
+            # Re-centre le repliement uniquement si le diapason a bougé sensiblement.
+            if abs(self._tuning_semitones - self._chroma_tau_applied) > self._TUNE_REBUILD:
+                self._rebuild_chroma_matrix(self._tuning_semitones)
 
     def _update_harmony(self, chroma):
         """Lisse le chroma, corrèle aux profils -> (tonal_warmth, key_hue).
