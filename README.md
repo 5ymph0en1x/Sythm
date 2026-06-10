@@ -12,6 +12,8 @@ That current is never random. It is steered, in secret, by a **Lorenz attractor*
 
 And since version 1.2, Sythm no longer merely *reacts* to sound — it **listens to the music**: it finds the beat, anticipates the downbeat, feels a build tighten and a drop break, and even reads the key. It can also render in **true stereoscopic 3D** — genuine two-camera depth, packed into the HDMI frame-packing format for a 3D display or projector.
 
+Version 1.3 gives that storm **two new worlds to inhabit**: an endless **hyperspace tunnel** that snakes through space — its bends steered by the hidden attractor, the rhythm arriving as rings of light — and a **living Mandelbulb**, a 3D fractal made not of polygons but of tens of millions of particles condensed onto its surface, whose very shape **mutates with the music**.
+
 ---
 
 ## The idea — a storm with a hidden conductor
@@ -65,12 +67,12 @@ Sythm is cut into independent slices, wired together by `main.py`. Each does one
 | Module | Role |
 |--------|------|
 | `audio_engine.py` | Loopback capture (WASAPI / PulseAudio-PipeWire). A **CPU** real FFT (NumPy `rfft`) feeds GPU DSP that produces the `AudioFeatures` snapshot: frequency bands, RMS, spectral centroid, **per-drum onsets** (kick/snare/hat), a **predictive tempo & phase** model, **phrase** cues (build/drop), **key & mode**, and a 512-bin log-spaced spectrum that **stays in VRAM** (`spectrum_gpu`). Only ~a dozen scalars ever return to the CPU. |
-| `particles.py` | The space-filling cloud, advected by the **ABC field whose coefficients are a hidden, RK4-integrated Lorenz system**; ballistic **trail emission** through a GPU ring buffer (tens of millions of points); percussive **shockwaves**, **shear sparkle**, **tonal relief**, **breathing**, **build/drop** and **harmonic** color. CUDA kernels (CuPy) writing into the GL buffers through **zero-copy** interop. |
+| `particles.py` | The space-filling cloud, advected by the **ABC field whose coefficients are a hidden, RK4-integrated Lorenz system**; ballistic **trail emission** through a GPU ring buffer (tens of millions of points); percussive **shockwaves**, **shear sparkle**, **tonal relief**, **breathing**, **build/drop** and **harmonic** color — plus two whole-world modes: the **snaking hyperspace tunnel** and the **particle Mandelbulb** (per-particle distance-field evaluation). CUDA kernels (CuPy) writing into the GL buffers through **zero-copy** interop. |
 | `renderer.py` | OpenGL 4.6 (moderngl): one `GL_POINTS` draw call, additive Gaussian sprites into an HDR (RGBA16F) framebuffer, MSAA resolve, perspective camera. `render(eye=…)` also builds the **off-axis stereo** projections. |
 | `postfx.py` | Fullscreen post-processing: **à-trous edge-aware denoise**, separable bloom, history-buffer motion blur, ACES / Uncharted-2 tone mapping, Lanczos downscale. |
 | `stereo.py` | **Stereoscopic 3D**: draws the one simulation through two **off-axis** cameras and packs the eyes into the HDMI **frame-packing 1080p** layout. Two independent post-FX chains — one per eye — so motion-blur history never bleeds across. |
 | `window.py` | GLFW window + OpenGL 4.6 core context, vsync, keyboard, resize. Borderless fullscreen targets the monitor **under the window**, so `F` follows you to a projector. |
-| `config_window.py` | The **launch-time settings window** (themed Tk): ~35 options in seven groups, five UI languages, one-click presets. Holds `DEFAULTS`, the **single source of truth** for every tunable, and persists choices to `sythm_config.json`. |
+| `config_window.py` | The **launch-time settings window** (themed Tk): ~45 options in eight groups across **four compact tabs** (fits a 1366×768 laptop), five UI languages, one-click presets. Holds `DEFAULTS`, the **single source of truth** for every tunable, and persists choices to `sythm_config.json`. |
 
 **The per-frame flow** is a short pipeline: `audio.get_features()` → `particles.update(dt, features)` → `renderer.render()` (an HDR texture) → `postfx.process(hdr, screen)` → `swap_buffers()`. In 3D mode the render-and-post-FX step runs **twice** — once per off-axis eye — and the two images are packed top-and-bottom into one frame; the simulation itself still runs only **once**.
 
@@ -153,7 +155,7 @@ The window title shows live FPS, particle count, effect state, and a `● REC` m
 | `ESC` | Quit (in 3D, return to the settings window) |
 | `B` | Toggle **bloom** |
 | `M` | Toggle **motion blur** |
-| `C` | Cycle **camera mode** (`fixed` → `auto_rotate` → `beat_reactive`) |
+| `C` | Cycle **camera mode** (`fixed` → `auto_rotate` → `beat_reactive` → `tunnel`) |
 | `F` | **Borderless fullscreen** on the monitor under the window (HDR-preserving; pixel-exact in 3D) |
 | `R` | Start / stop **recording** (H.265 / HEVC → `.mp4`) |
 
@@ -171,7 +173,7 @@ Both encode **10-bit** by default (HEVC *Main10*, which kills the banding that 8
 
 ## The configuration window
 
-Launching Sythm opens a **settings window first** — themed, dark, and translated into **five languages** (English, Deutsch, Français, Italiano, Español), switchable live. Around **35 settings** are grouped into seven panels — Cloud, Window & rendering, Post-FX, Rhythm & flow, Color & harmony, Camera & capture, and Stereoscopic 3D — and a row of one-click **presets** (*Ambient, Minimal, Energetic, Cosmic, Percussive*) dials in a whole look at once. Adjust, then click **Launch**; your choices are saved to **`sythm_config.json`** and reloaded next time.
+Launching Sythm opens a **settings window first** — themed, dark, and translated into **five languages** (English, Deutsch, Français, Italiano, Español), switchable live. Around **45 settings** are grouped into eight panels, laid out across **four compact tabs** — Cloud & effects · Rhythm & flow · Colour & camera · Window, 3D & fractal — so the whole window fits comfortably on a **1366×768 laptop screen**, and a row of one-click **presets** (*Ambient, Minimal, Energetic, Cosmic, Percussive, Cognitive, Tunnel, Mandelbulb*) dials in a whole look at once. *Mandelbulb* renders a **living 3D fractal**: every particle evaluates the Mandelbulb's distance field on the GPU and the cloud condenses onto its surface, where the ABC flow glides along the shell — a fractal made of current, not stone — while a continuous rain of re-seeded comets keeps the coating fresh, the **power *n* mutates with the music** (the drop precipitates a visible metamorphosis), color follows the orbit trap (each lobe its own hue), and the percussive shockwaves ripple across the shell. *Tunnel* deserves a word: it turns the box into an **endless, snaking hyperspace tube** — the bends steered by the smoothed state of the hidden Lorenz attractor, the camera flying down the curved axis and banking into the turns — where the rhythm arrives as **rings of light** sweeping toward you (a kick inflates the wall, a snare wrenches it, a hat sparkles), and the drop fires a wall of light from the far end while the tunnel straightens and the field of view dilates. Adjust, then click **Launch**; your choices are saved to **`sythm_config.json`** and reloaded next time.
 
 Under the hood, `config_window.DEFAULTS` is the **single source of truth** for every tunable — `main.py` and `particles.py` read their constants from it — so there is exactly one place to change a factory default.
 
