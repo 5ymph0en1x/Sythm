@@ -70,9 +70,17 @@ import sys
 import math
 import time
 import threading
-from dataclasses import dataclass, field
 
 import numpy as np
+
+# DONNÉE partagée + ANALYSE musicale de haut niveau, désormais DÉCOUPLÉES de ce
+# moteur (qui ne fait plus QUE l'acquisition : capture + FFT GPU + réductions).
+# On RÉ-EXPORTE AudioFeatures -> `from audio_engine import AudioFeatures` reste
+# valide (contrat figé inchangé pour particles/renderer). Les constantes de
+# lissage (ATTACK/RELEASE/MAX_DECAY) sont partagées : on les réutilise pour le
+# lissage du spectre GPU afin que CPU (analyseur) et GPU (ici) restent calés.
+from audio_features import AudioFeatures
+from musical_analyzer import MusicalAnalyzer, RawFrame, ATTACK, RELEASE, MAX_DECAY
 
 # ---------------------------------------------------------------------------
 # Import de CuPy (OBLIGATOIRE pour ce module).
@@ -105,133 +113,11 @@ except Exception as _exc:
 
 
 # ===========================================================================
-#  AudioFeatures : photo instantanée des caractéristiques audio.
+#  AudioFeatures + _OnsetDetector ont DÉMÉNAGÉ (découplage).
+#    - AudioFeatures  -> audio_features.py   (ré-exportée ci-dessus -> contrat ok)
+#    - _OnsetDetector -> musical_analyzer.py  (utilisé par RhythmTracker)
+#  Ce module ne garde QUE l'acquisition (capture + FFT GPU + réductions).
 # ===========================================================================
-@dataclass
-class AudioFeatures:
-    """Instantané thread-safe des features audio pour UNE frame de rendu.
-
-    Tous les scalaires sont des floats Python (lissés, normalisés ~0..1).
-    Le seul champ GPU est `spectrum_gpu` : un tableau CuPy float32 de longueur
-    AudioEngine.N_SPECTRUM, normalisé 0..1, qui RESTE EN VRAM pour être lu
-    directement par le module de particules (device-to-device, pas de
-    rapatriement CPU).
-
-    Voir le contrat partagé en tête de fichier : noms et unités sont figés.
-    """
-    bass: float = 0.0          # 20–150 Hz     (lissé, 0..1)
-    low_mid: float = 0.0       # 150–500 Hz    (lissé, 0..1)
-    mid: float = 0.0           # 500–2000 Hz   (lissé, 0..1)
-    high: float = 0.0          # 2000–16000 Hz (lissé, 0..1)
-    amplitude: float = 0.0     # RMS global    (0..1)
-    beat: float = 0.0          # force d'onset (0..1, décroît dans le temps)
-    is_beat: bool = False      # True sur la frame où un onset est détecté
-    centroid: float = 0.0      # centroïde spectral normalisé 0..1 (grave->aigu)
-    # Spectre downsamplé EN VRAM (CuPy float32, (N_SPECTRUM,), 0..1).
-    # default_factory=None -> rempli par AudioEngine ; reste None si GPU absent.
-    spectrum_gpu: "cp.ndarray | None" = None
-    t: float = 0.0             # secondes depuis AudioEngine.start()
-    # --- EXTENSIONS (non-cassantes) : la forme d'onde brute récente, « donnée »
-    # source pour une reconstruction d'attracteur par plongement (cf. particles).
-    waveform_gpu: "cp.ndarray | None" = None   # derniers fft_size échantillons bruts (GPU)
-    samples_written: int = 0                   # total d'échantillons capturés (compteur)
-    # --- EXTENSIONS (non-cassantes) : ONSETS PERCUSSIFS PAR REGISTRE.
-    # Détection d'attaque séparée pour les trois grandes voix de la batterie, afin
-    # que chacune déclenche un GESTE visuel distinct (cf. particles : ondes de choc
-    # kick/snare/charley). Comme `beat`/`is_beat`, l'enveloppe décroît dans le temps
-    # et le booléen `*_hit` n'est vrai QUE sur la frame de déclenchement.
-    kick: float = 0.0          # onset GRAVE (sub/basses, ~20–150 Hz)   0..1, décroît
-    snare: float = 0.0         # onset MÉDIUM large (caisse/clap, ~150–2000 Hz)
-    hat: float = 0.0           # onset AIGU (charley/cymbales, ~2–16 kHz)
-    kick_hit: bool = False     # True sur la frame d'attaque grave
-    snare_hit: bool = False    # True sur la frame d'attaque médium
-    hat_hit: bool = False      # True sur la frame d'attaque aiguë
-    # --- EXTENSIONS (non-cassantes) : MODÈLE DE TEMPO / PHASE (entraînement au
-    # groove). Un oscillateur adaptatif s'accroche au pouls et PRÉDIT le temps
-    # fort -> permet l'ANTICIPATION (la nuée inspire avant le beat) et une houle
-    # caméra calée sur la mesure. S'efface seul (groove_conf->0) sur la musique
-    # sans pulsation nette. Mis à jour à CHAQUE frame (la phase avance en continu).
-    tempo_bpm: float = 0.0       # tempo estimé (battements/min ; 0 = pas verrouillé)
-    pulse_phase: float = 0.0     # phase du battement [0,1) (0 = sur le temps)
-    bar_phase: float = 0.0       # phase lente sur 4 temps [0,1) (« houle » de mesure)
-    groove_conf: float = 0.0     # confiance du verrouillage [0,1] (porte tout l'effet)
-    anticipation: float = 0.0    # [0,1] : monte AVANT le temps fort prédit (l'inspir)
-    # --- EXTENSIONS (non-cassantes) : ANTICIPATION DE PHRASE (build / drop).
-    # Échelle SUPÉRIEURE au battement : la TENSION qui s'accumule pendant un build
-    # (filtre qui s'ouvre, roulement qui accélère, sub qui se retire) PUIS le DROP
-    # (relâche quand le sub/kick claque de nouveau). Gated par groove_conf.
-    build: float = 0.0           # [0,1] : charge de tension qui s'accumule (avant le drop)
-    drop: float = 0.0            # [0,1] : impulsion de relâche au drop (décroît)
-    phrase_phase: float = 0.0    # [0,1] : phase de phrase, recalée au drop
-    # --- EXTENSIONS (non-cassantes) : COULEUR DE L'HARMONIE.
-    # Chroma 12 classes -> corrélation aux profils de tonalité (Krumhansl) :
-    # tonal_warmth = axe MAJEUR(chaud)/MINEUR(froid) ; key_hue = teinte-maison de la
-    # tonalité. Très LENTS (l'harmonie change sur des mesures). Teintent la palette.
-    tonal_warmth: float = 0.0    # [-1,1] : +1 majeur (chaud) … -1 mineur (froid)
-    key_hue: float = 0.0         # [0,1) : fondamentale estimée / 12 (teinte-maison)
-
-
-# ===========================================================================
-#  Détecteur d'ONSET générique (flux spectral half-wave + seuil adaptatif).
-# ===========================================================================
-class _OnsetDetector:
-    """Détecteur d'attaque sur UN signal d'énergie de bande (scalaire par frame).
-
-    Même principe que la détection de beat historique, mais factorisé pour être
-    instancié une fois PAR REGISTRE (grave / médium / aigu) avec ses propres
-    constantes — une charley n'a pas la même dynamique qu'un kick.
-
-    Principe :
-      * flux = hausse half-wave rectifiée de l'énergie depuis la frame précédente ;
-      * seuil ADAPTATIF = moyenne glissante + k·écart-type glissant du flux
-        (robuste quel que soit le niveau global) ;
-      * un franchissement déclenche une impulsion `env=1.0` qui décroît
-        géométriquement ; `hit` n'est vrai QUE sur la frame de déclenchement, avec
-        une période réfractaire pour éviter les doubles déclenchements.
-
-    Renvoie (env 0..1, hit bool) à chaque `update`.
-    """
-
-    __slots__ = ("_prev", "_avg", "_var", "_env", "_last_t",
-                 "refractory", "decay", "k", "_a")
-
-    def __init__(self, refractory=0.08, decay=0.85, k=1.6, smoothing=0.03):
-        self._prev = 0.0        # énergie de bande à la frame précédente
-        self._avg = 1e-6        # moyenne glissante du flux (seuil)
-        self._var = 1e-6        # variance glissante du flux
-        self._env = 0.0         # impulsion d'onset (décroît)
-        self._last_t = -1.0     # instant du dernier onset (anti-rebond)
-        self.refractory = float(refractory)
-        self.decay = float(decay)
-        self.k = float(k)
-        self._a = float(smoothing)   # vitesse d'adaptation des stats glissantes
-
-    def update(self, value: float, now: float) -> tuple[float, bool]:
-        flux = value - self._prev
-        if flux < 0.0:
-            flux = 0.0
-        self._prev = value
-        a = self._a
-        self._avg = (1.0 - a) * self._avg + a * flux
-        dev = flux - self._avg
-        self._var = (1.0 - a) * self._var + a * (dev * dev)
-        std = math.sqrt(self._var)
-        threshold = self._avg + self.k * std + 1e-6
-        hit = False
-        if flux > threshold and (now - self._last_t) > self.refractory:
-            self._env = 1.0
-            self._last_t = now
-            hit = True
-        else:
-            self._env *= self.decay
-        if self._env > 1.0:
-            self._env = 1.0
-        return self._env, hit
-
-    def decay_only(self) -> float:
-        """Cas silence : on fait juste décroître l'impulsion (aucun onset)."""
-        self._env *= self.decay
-        return self._env
 
 
 # ===========================================================================
@@ -464,20 +350,44 @@ class AudioEngine:
         self._build_harmony()
 
         # ------------------------------------------------------------------ #
-        #  État de lissage / normalisation (CPU, scalaires) — persistant     #
-        #  entre frames. Tout ceci ne vit QUE dans le thread de rendu.       #
+        #  PSYCHOACOUSTIQUE : pondération d'ISOSONIE (sonie perçue).          #
         # ------------------------------------------------------------------ #
-        # Enveloppes lissées des 4 bandes + amplitude (attaque rapide /
-        # release lent -> rendu fluide mais réactif).
-        self._env_bands = np.zeros(4, dtype=np.float32)
-        self._env_amp = 0.0
-        self._attack = 0.6     # 0..1 : plus grand = montée plus rapide
-        self._release = 0.10   # 0..1 : plus petit = descente plus lente
+        # Courbe de pondération A (forme close, normalisée à 1 @ 1 kHz) : approxime la
+        # sensibilité fréquentielle de l'oreille (contour d'isosonie ~40 phon de
+        # Fletcher-Munson — sourde au sub-grave et aux très aigus, ultra-sensible vers
+        # 2–5 kHz). Sert à dériver une SONIE perçue et un ÉQUILIBRE de bandes perçu au
+        # lieu de l'énergie physique brute : le préset « Cognitive » ne fait réagir la
+        # nuée qu'à ce que l'humain ENTEND vraiment. Poids en ÉNERGIE (A²) pré-uploadé
+        # en VRAM -> une réduction pondérée par frame (coût négligeable).
+        a_lin = self._a_weighting(freqs_np)              # gain ~sensibilité (1 @ 1 kHz)
+        self._loud_w2_gpu = cp.asarray((a_lin * a_lin).astype(np.float32))   # poids énergie
+        # Poids perceptuel MOYEN par bande (RMS de l'énergie A-pondérée), normalisé à 1
+        # sur la bande la + sensible -> donne l'équilibre de bandes tel que l'oreille
+        # le perçoit (le grave pèse bien moins que sa seule énergie ne le dirait).
+        a2 = (a_lin * a_lin).astype(np.float64)
+        pb = np.zeros(4, dtype=np.float64)
+        for i, (_n, f_lo, f_hi) in enumerate(self.BAND_EDGES):
+            m = (freqs_np >= f_lo) & (freqs_np < f_hi)
+            pb[i] = math.sqrt(a2[m].mean()) if m.any() else 0.0
+        self._perc_band_w = (pb / (pb.max() + 1e-12)).astype(np.float32)      # (4,) max=1
 
-        # Normalisation adaptative (AGC doux) : max glissant par bande + ampl.
-        self._running_max_bands = np.full(4, 1e-3, dtype=np.float32)
-        self._running_max_amp = 1e-3
-        self._max_decay = 0.9995   # le max glissant redescend lentement
+        # BASSE PROFONDE (sub ~20–60 Hz) : poids de réduction (moyenne sur les bins du
+        # sub), pré-uploadé en VRAM. NON pondéré isosonie -> c'est la force RESSENTIE.
+        sub_mask = (freqs_np >= 20.0) & (freqs_np < 60.0)
+        sub_w = np.zeros_like(freqs_np, dtype=np.float32)
+        if sub_mask.any():
+            sub_w[sub_mask] = 1.0 / float(sub_mask.sum())
+        self._sub_w_gpu = cp.asarray(sub_w)
+
+        # ------------------------------------------------------------------ #
+        #  ANALYSEUR MUSICAL (sémantique de haut niveau) — DÉCOUPLÉ.          #
+        # ------------------------------------------------------------------ #
+        # Tout le suivi de bandes/amplitude + beat + onsets + tempo + phrase +
+        # harmonie + perceptuel vit désormais dans MusicalAnalyzer (musical_analyzer.py)
+        # : testable sans micro. On lui injecte les poids d'isosonie par bande (CPU)
+        # calculés ci-dessus. Le moteur ne garde que l'acquisition + le spectre GPU.
+        self._analyzer = MusicalAnalyzer(self._perc_band_w,
+                                         self.SPECTRUM_FMIN, self.SPECTRUM_FMAX)
 
         # Lissage + peak-hold du spectre, ENTIÈREMENT sur GPU (persistant).
         self._env_spectrum_gpu = cp.zeros(self.N_SPECTRUM, dtype=cp.float32)
@@ -487,47 +397,8 @@ class AudioEngine:
         # suivante). 512 floats -> copie négligeable.
         self._spectrum_out_gpu = cp.zeros(self.N_SPECTRUM, dtype=cp.float32)
 
-        # Détection de beat (flux spectral sur bass+low_mid, seuil adaptatif).
-        self._prev_lowband_mag = np.zeros(2, dtype=np.float32)  # [bass, low_mid]
-        self._flux_avg = 1e-6     # moyenne glissante du flux (seuil adaptatif)
-        self._flux_var = 1e-6     # variance glissante (seuil = moy + k*ecart-type)
-        self._beat_env = 0.0      # impulsion de beat qui décroît
-        self._beat_decay = 0.86   # décroissance par frame de l'impulsion
-        self._last_beat_t = -1.0  # anti-rebond : pas deux beats trop rapprochés
-        self._beat_refractory = 0.10  # 100 ms mini entre deux onsets
-
-        # Onsets PERCUSSIFS par registre (kick/snare/charley) — un détecteur par
-        # voix, avec des constantes propres à sa dynamique. Le kick est lent et
-        # massif (réfractaire long, décroissance douce) ; la charley est vive et
-        # serrée (réfractaire court, décroissance rapide). Le snare écoute une
-        # bande médium LARGE (caisse claire/clap = transitoire à large spectre).
-        self._onset_kick = _OnsetDetector(refractory=0.11, decay=0.84, k=1.5)
-        self._onset_snare = _OnsetDetector(refractory=0.07, decay=0.80, k=1.7)
-        self._onset_hat = _OnsetDetector(refractory=0.045, decay=0.72, k=1.9)
-
-        # OSCILLATEUR DE TEMPO/PHASE (entraînement au groove, façon oscillateur
-        # adaptatif). Alimenté par les beats `is_beat` ; corrige doucement sa
-        # période et sa phase à chaque battement, et avance librement entre deux.
-        self._tempo_period = 0.5    # s par battement (120 BPM par défaut)
-        self._tempo_phase = 0.0     # phase courante [0,1)
-        self._tempo_conf = 0.0      # confiance de verrouillage [0,1]
-        self._tempo_last_t = 0.0    # horodatage du dernier update de phase
-        self._tempo_last_beat_t = -1.0  # dernier battement encaissé
-        self._bar_count = 0         # compteur de temps (0..3) -> phase de mesure
-
-        # TRAQUEUR DE PHRASE (build / drop) — échelle macro, gated par le verrou.
-        # Tension = filtre qui s'ouvre (centroïde + aigus) + activité percussive ;
-        # un BUILD = tension qui monte sur des secondes (fast EMA > slow EMA) ; un
-        # DROP = le sub qui SLAMME de nouveau alors qu'un build était chargé.
-        self._phrase_bars = 8       # longueur de phrase (mesures de 4 temps)
-        self._tension_fast = 0.0    # EMA rapide de la tension (~1 s)
-        self._tension_slow = 0.0    # EMA lente (~plusieurs s) -> ligne de base
-        self._bass_slow = 0.0       # EMA lente du grave (pour détecter le SLAM)
-        self._build = 0.0           # charge lissée [0,1]
-        self._build_target = 0.0    # cible de charge (mise à jour à l'analyse)
-        self._drop_env = 0.0        # impulsion de drop (décroît)
-        self._last_drop_t = -10.0   # anti-rebond entre deux drops
-        self._phrase_beat = 0       # compteur de temps DANS la phrase
+        # (Beat, onsets, oscillateur de tempo/phase et traqueur de phrase ont
+        #  déménagé dans MusicalAnalyzer.RhythmTracker — cf. self._analyzer.)
 
         # Cadence d'analyse : on évite de relancer une FFT plus souvent que
         # nécessaire (si get_features est appelé à 240 fps alors qu'un nouveau
@@ -579,6 +450,22 @@ class AudioEngine:
                 idx = int(np.argmin(np.abs(freqs - 0.5 * (f_lo + f_hi))))
                 mat[i, idx] = 1.0
         return mat
+
+    @staticmethod
+    def _a_weighting(freqs: np.ndarray) -> np.ndarray:
+        """Pondération A (IEC 61672, forme close), en gain LINÉAIRE normalisé à 1 @
+        1 kHz. Approxime la sensibilité de l'oreille (contour d'isosonie ~40 phon) :
+        ~0.10 (−20 dB) vers 50 Hz, pic ~1.0 vers 2–3 kHz, redescend dans l'extrême
+        aigu. Le bin DC (f=0) reçoit un poids nul (numérateur ∝ f⁴)."""
+        f = np.asarray(freqs, dtype=np.float64)
+        f2 = f * f
+        c1, c2, c3, c4 = 20.6 ** 2, 107.7 ** 2, 737.9 ** 2, 12194.0 ** 2
+        num = (c4 * f2 * f2)
+        den = (f2 + c1) * np.sqrt((f2 + c2) * (f2 + c3)) * (f2 + c4) + 1e-30
+        ra = num / den
+        fk = 1000.0 ** 2                          # normalisation à 1 kHz
+        ra_1k = (c4 * fk * fk) / ((fk + c1) * math.sqrt((fk + c2) * (fk + c3)) * (fk + c4))
+        return (ra / (ra_1k + 1e-30)).astype(np.float32)
 
     # ------------------------------------------------------------------ #
     #  Cycle de vie : start / stop                                       #
@@ -783,7 +670,7 @@ class AudioEngine:
             with self._feat_lock:
                 feats = self._last_features
             feats.t = time.perf_counter() - self._t0
-            self._apply_tempo(feats, feats.t, False)   # phase continue (pas de beat frais)
+            self._analyzer.apply_tempo(feats, feats.t, False)  # phase continue (pas de beat frais)
             return feats
 
         # Anti-redondance : si aucun bloc neuf significatif depuis la dernière
@@ -793,20 +680,23 @@ class AudioEngine:
             with self._feat_lock:
                 feats = self._last_features
             feats.t = time.perf_counter() - self._t0
-            self._apply_tempo(feats, feats.t, False)   # phase continue (snapshot recyclé)
+            self._analyzer.apply_tempo(feats, feats.t, False)  # phase continue (snapshot recyclé)
             return feats
         self._last_analyzed_frame = written
 
-        # --- Analyse complète sur GPU --------------------------------------
-        feats = self._analyze_window(win)
-        feats.t = time.perf_counter() - self._t0
+        # --- Réductions GPU (ici) -> sémantique musicale (analyseur) -------------
+        # `now` est calculé UNE fois et injecté : timing unifié sur la frame (au lieu
+        # de 3 lectures perf_counter dispersées) + déterminisme pour les tests.
+        now = time.perf_counter() - self._t0
+        feats = self._analyze_window(win, now)
+        feats.t = now
         # Expose la forme d'onde brute (GPU) + le compteur d'échantillons : la
         # « donnée » que le module de particules plonge en retards pour
         # reconstruire l'attracteur du son (device-to-device, pas de copie CPU).
         feats.waveform_gpu = cp.asarray(win, dtype=cp.float32)
         feats.samples_written = int(written)
         # Oscillateur de tempo : corrige période/phase sur ce battement frais.
-        self._apply_tempo(feats, feats.t, bool(feats.is_beat))
+        self._analyzer.apply_tempo(feats, now, bool(feats.is_beat))
         with self._feat_lock:
             self._last_features = feats
         return feats
@@ -815,14 +705,18 @@ class AudioEngine:
     #  Cœur DSP : analyse d'une fenêtre fft_size -> AudioFeatures.       #
     #  Tout le lourd est sur GPU ; on ne rapatrie que ~10 scalaires.     #
     # ------------------------------------------------------------------ #
-    def _analyze_window(self, win: np.ndarray) -> AudioFeatures:
+    def _analyze_window(self, win: np.ndarray, now: float) -> AudioFeatures:
+        """ACQUISITION d'une frame : RMS + FFT + réductions pondérées (GPU). Produit
+        une RawFrame que le MusicalAnalyzer interprète (sémantique musicale, CPU).
+        `now` (s) est INJECTÉ -> timing unifié sur la frame + déterminisme pour les
+        tests. Tout le lourd reste sur GPU ; on ne rapatrie que ~7 scalaires + chroma."""
         # RMS temporel (amplitude brute) — petit calcul CPU avant l'upload.
         block_rms = float(np.sqrt(np.mean(win.astype(np.float64) ** 2)) + 1e-12)
 
-        # Silence quasi total : on décroît les enveloppes et on publie ~0 sans
-        # toucher au GPU lourdement (on garde quand même un spectrum_gpu valide).
+        # Silence quasi total : l'analyseur décroît ses enveloppes ; on lui fournit un
+        # spectrum_gpu valide (zéros lissés) -> on ne casse pas le consommateur GPU.
         if block_rms < 1e-5:
-            return self._silent_features()
+            return self._analyzer.silent(self._decay_spectrum_silent())
 
         # --- FFT réelle + magnitude (CPU/numpy), PUIS upload de la magnitude ---
         # La rfft d'une fenêtre de fft_size points (~4096) coûte quelques µs en
@@ -843,6 +737,12 @@ class AudioEngine:
         g_band_rms = cp.sqrt(
             cp.sum(self._band_matrix * g_pow[None, :], axis=1) + 1e-12)   # (4,)
 
+        # --- SONIE perçue : niveau large bande A-PONDÉRÉ (isosonie). Même réduction
+        # diffusée que les bandes (pas de @, donc pas de cuBLAS) -> 1 scalaire. ---
+        g_loud = cp.sqrt(cp.sum(self._loud_w2_gpu * g_pow) + 1e-12)
+        # --- BASSE PROFONDE ressentie : énergie du sub (20–60 Hz), SANS isosonie. ---
+        g_sub = cp.sqrt(cp.sum(self._sub_w_gpu * g_pow) + 1e-12)
+
         # --- Centroïde spectral (barycentre des fréquences pondéré par mag) --
         # centroid_hz = sum(f * mag) / sum(mag). Reste sur GPU.
         mag_sum = cp.sum(g_mag) + 1e-9
@@ -859,155 +759,65 @@ class AudioEngine:
         # --- DIAPASON : estime l'accordage global et re-centre le repliement chroma
         #     dessus (invariance au diapason : La=432, vinyle ralenti…). Lent, gardé.
         self._update_tuning(g_spec)
-
-        # --- HARMONIE : chroma 12 classes (réduction diffusée, reste GPU) puis
-        #     corrélation aux profils de tonalité (Krumhansl) -> warmth + key_hue.
+        # --- CHROMA 12 classes (réduction GPU) -> corrélé par l'analyseur (HarmonyAnalyzer).
         g_chroma = cp.sum(self._chroma_matrix_gpu * g_spec[None, :], axis=1)   # (12,)
-        warmth_now, key_hue_now = self._update_harmony(
-            cp.asnumpy(g_chroma).astype(np.float64))
 
-        # ---- RAPATRIEMENT GPU->CPU : seulement 4 + 1 scalaires ----
-        band_rms = cp.asnumpy(g_band_rms).astype(np.float32)        # (4,)
-        centroid_hz = float(cp.asnumpy(g_centroid_hz))
+        # --- Spectre GPU : normalisation adaptative + lissage, EN VRAM (jamais CPU). ---
+        spectrum_gpu_frame = self._smooth_spectrum(g_spec)
 
-        # --- Normalisation adaptative (AGC doux) sur bandes + amplitude ---
-        norm_bands = self._adaptive_normalize_bands(band_rms)
-        norm_amp = self._adaptive_normalize_amp(block_rms)
+        # ---- Frame BRUTE (scalaires CPU + chroma + spectre GPU) -> ANALYSEUR ----
+        # On ne rapatrie que ~7 scalaires + le vecteur chroma (12) ; la sémantique
+        # musicale (normalisation, beat, onsets, tempo, phrase, harmonie, perceptuel)
+        # vit dans MusicalAnalyzer.analyze (CPU, testable). spectrum_gpu reste en VRAM.
+        raw = RawFrame(
+            band_rms=cp.asnumpy(g_band_rms).astype(np.float32),     # (4,)
+            block_rms=block_rms,
+            centroid_hz=float(cp.asnumpy(g_centroid_hz)),
+            loud_lin=float(cp.asnumpy(g_loud)),                     # niveau A-pondéré
+            sub_lin=float(cp.asnumpy(g_sub)),                       # niveau sub-grave
+            chroma=cp.asnumpy(g_chroma).astype(np.float64),
+            spectrum_gpu=spectrum_gpu_frame,
+        )
+        return self._analyzer.analyze(raw, now)
 
-        # --- Lissage temporel (attaque rapide / release lent) ---
-        sm_bands = self._envelope_follow_bands(norm_bands)
-        sm_amp = self._envelope_follow_amp(norm_amp)
-
-        # --- Spectre GPU : normalisation adaptative + lissage, EN VRAM ---
-        # On ne quitte jamais le GPU pour le spectre 512 bins.
-        self._spectrum_max_gpu *= self._max_decay
+    # ------------------------------------------------------------------ #
+    #  Lissage du SPECTRE 512 bins (GPU). Reste dans le moteur car c'est du
+    #  travail GPU sur le thread de rendu (jamais rapatrié côté CPU).
+    # ------------------------------------------------------------------ #
+    def _smooth_spectrum(self, g_spec):
+        """Normalisation adaptative (max glissant) + lissage (attaque/release) du
+        spectre 512, ENTIÈREMENT en VRAM. Renvoie une COPIE indépendante par frame
+        (le consommateur la lit pendant que la frame suivante se calcule)."""
+        self._spectrum_max_gpu *= MAX_DECAY
         cp.maximum(self._spectrum_max_gpu, g_spec, out=self._spectrum_max_gpu)
         cp.maximum(self._spectrum_max_gpu, 1e-3, out=self._spectrum_max_gpu)
         norm_spec = g_spec / self._spectrum_max_gpu      # (N_SPECTRUM,) ~0..1
-        # Lissage par bin (attaque rapide / release lent) directement sur GPU.
         up = norm_spec > self._env_spectrum_gpu
-        coeff = cp.where(up, np.float32(self._attack), np.float32(self._release))
+        coeff = cp.where(up, np.float32(ATTACK), np.float32(RELEASE))
         self._env_spectrum_gpu = (
             self._env_spectrum_gpu + coeff * (norm_spec - self._env_spectrum_gpu)
         )
         cp.clip(self._env_spectrum_gpu, 0.0, 1.0, out=self._spectrum_out_gpu)
-        # COPIE par frame : on remet une copie indépendante pour qu'une frame
-        # suivante n'écrase pas le tableau que le consommateur est en train de
-        # lire. 512 floats -> copie device-to-device quasi gratuite.
-        spectrum_gpu_frame = self._spectrum_out_gpu.copy()
+        return self._spectrum_out_gpu.copy()
 
-        # --- Centroïde normalisé 0..1 (échelle log entre FMIN et FMAX) ---
-        # log-mapping car la perception de hauteur est logarithmique -> teinte
-        # plus « naturelle » côté shaders.
-        c = (np.log10(max(centroid_hz, self.SPECTRUM_FMIN))
-             - np.log10(self.SPECTRUM_FMIN)) / (
-                np.log10(self.SPECTRUM_FMAX) - np.log10(self.SPECTRUM_FMIN))
-        centroid_norm = float(min(max(c, 0.0), 1.0))
+    def _decay_spectrum_silent(self):
+        """Cas silence : le spectre GPU décroît doucement vers 0 (toujours valide en
+        VRAM). Renvoie la copie par frame fournie à MusicalAnalyzer.silent()."""
+        self._env_spectrum_gpu *= np.float32(0.85)
+        self._spectrum_max_gpu *= MAX_DECAY
+        cp.clip(self._env_spectrum_gpu, 0.0, 1.0, out=self._spectrum_out_gpu)
+        return self._spectrum_out_gpu.copy()
 
-        # --- Détection de beat (flux spectral bass+low_mid, seuil adaptatif) -
-        beat_strength, is_beat = self._detect_beat(band_rms[:2])
-
-        # --- Onsets PERCUSSIFS par registre (sur les énergies de bande BRUTES) -
-        # kick = grave ; snare = médium LARGE (low_mid+mid, transitoire de caisse
-        # claire/clap) ; charley = aigu. Chacun alimente un geste visuel distinct.
-        now = time.perf_counter() - self._t0
-        kick_s, kick_h = self._onset_kick.update(float(band_rms[0]), now)
-        snare_s, snare_h = self._onset_snare.update(
-            float(band_rms[1] + band_rms[2]), now)
-        hat_s, hat_h = self._onset_hat.update(float(band_rms[3]), now)
-
-        # --- Traqueur de PHRASE (build/drop) sur les features lissées/normalisées.
-        self._phrase_detect(high=float(sm_bands[3]), centroid=centroid_norm,
-                            snare=snare_s, hat=hat_s, bass=float(sm_bands[0]), now=now)
-
-        return AudioFeatures(
-            bass=float(sm_bands[0]),
-            low_mid=float(sm_bands[1]),
-            mid=float(sm_bands[2]),
-            high=float(sm_bands[3]),
-            amplitude=float(sm_amp),
-            beat=float(beat_strength),
-            is_beat=bool(is_beat),
-            centroid=centroid_norm,
-            spectrum_gpu=spectrum_gpu_frame,
-            t=0.0,   # rempli par get_features()
-            kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
-            kick_hit=bool(kick_h), snare_hit=bool(snare_h), hat_hit=bool(hat_h),
-            tonal_warmth=float(warmth_now), key_hue=float(key_hue_now),
-        )
+    # (Le suivi de bandes/amplitude (AGC + enveloppe) et la détection de beat ont
+    #  déménagé dans MusicalAnalyzer ; cf. self._analyzer.)
 
     # ------------------------------------------------------------------ #
-    #  Helpers de normalisation / lissage (CPU, scalaires).              #
-    # ------------------------------------------------------------------ #
-    def _adaptive_normalize_bands(self, raw: np.ndarray) -> np.ndarray:
-        """AGC doux par bande : on divise par un max glissant (suit les pics,
-        redescend lentement). Garde les features ~0..1 quel que soit le volume
-        système, sans pompage brutal."""
-        self._running_max_bands *= self._max_decay
-        self._running_max_bands = np.maximum(self._running_max_bands, raw)
-        self._running_max_bands = np.maximum(self._running_max_bands, 1e-3)
-        return raw / self._running_max_bands
-
-    def _adaptive_normalize_amp(self, raw: float) -> float:
-        self._running_max_amp *= self._max_decay
-        self._running_max_amp = max(self._running_max_amp, raw, 1e-3)
-        return raw / self._running_max_amp
-
-    def _envelope_follow_bands(self, target: np.ndarray) -> np.ndarray:
-        """Suiveur d'enveloppe : attaque rapide à la montée, release lent à la
-        descente -> bandes fluides mais réactives."""
-        up = target > self._env_bands
-        coeff = np.where(up, self._attack, self._release).astype(np.float32)
-        self._env_bands = self._env_bands + coeff * (target - self._env_bands)
-        return self._env_bands
-
-    def _envelope_follow_amp(self, target: float) -> float:
-        coeff = self._attack if target > self._env_amp else self._release
-        self._env_amp = self._env_amp + coeff * (target - self._env_amp)
-        return self._env_amp
-
-    def _detect_beat(self, lowband_rms: np.ndarray) -> tuple[float, bool]:
-        """Onset/beat via flux spectral half-wave sur (bass + low_mid).
-
-        Principe :
-          * flux = somme des hausses de magnitude des bandes graves (half-wave
-            rectified) entre la frame précédente et l'actuelle.
-          * seuil adaptatif = moyenne glissante + k * écart-type glissant du
-            flux -> robuste quel que soit le niveau global.
-          * un onset (flux > seuil) déclenche une impulsion `beat=1.0` qui
-            décroît géométriquement ensuite ; `is_beat` est True uniquement sur
-            la frame de déclenchement, avec une période réfractaire pour éviter
-            les doubles déclenchements sur un même coup.
-        """
-        # Flux half-wave rectifié sur les deux bandes graves.
-        diff = lowband_rms - self._prev_lowband_mag
-        flux = float(np.sum(np.maximum(diff, 0.0)))
-        self._prev_lowband_mag = lowband_rms.astype(np.float32, copy=True)
-
-        # Statistiques glissantes du flux (moyenne + variance) pour le seuil.
-        self._flux_avg = 0.97 * self._flux_avg + 0.03 * flux
-        dev = flux - self._flux_avg
-        self._flux_var = 0.97 * self._flux_var + 0.03 * (dev * dev)
-        std = float(np.sqrt(self._flux_var))
-        threshold = self._flux_avg + 1.6 * std + 1e-6
-
-        now = time.perf_counter() - self._t0
-        is_beat = False
-        if flux > threshold and (now - self._last_beat_t) > self._beat_refractory:
-            self._beat_env = 1.0          # attaque immédiate
-            self._last_beat_t = now
-            is_beat = True
-        else:
-            self._beat_env *= self._beat_decay   # décroissance de l'impulsion
-
-        return float(min(self._beat_env, 1.0)), is_beat
-
-    # ------------------------------------------------------------------ #
-    #  Analyse HARMONIQUE : chroma 12 classes + profils de tonalité Krumhansl.
+    #  Analyse HARMONIQUE : chroma 12 classes + diapason (GPU). La corrélation
+    #  tonale (Krumhansl -> warmth/key) vit dans MusicalAnalyzer.HarmonyAnalyzer.
     # ------------------------------------------------------------------ #
     def _build_harmony(self):
-        """Pré-calcule la matrice chroma (12 x N_SPECTRUM) et les 24 profils de
-        tonalité (majeur/mineur × 12 rotations) normalisés pour la corrélation."""
+        """Pré-calcule la matrice chroma (12 x N_SPECTRUM) + l'estimateur de diapason
+        (GPU). La corrélation aux profils Krumhansl vit dans HarmonyAnalyzer."""
         # Centres (Hz) des N_SPECTRUM bins log du spectre downsamplé.
         edges = np.logspace(np.log10(self.SPECTRUM_FMIN),
                             np.log10(self.SPECTRUM_FMAX), self.N_SPECTRUM + 1)
@@ -1044,28 +854,9 @@ class AudioEngine:
         self._chroma_tau_applied = 0.0
         # Matrice chroma initiale (τ = 0 -> grille A=440 standard).
         self._rebuild_chroma_matrix(0.0)
-        # Profils Krumhansl-Schmuckler (poids par classe, clé en 0).
-        ks_major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09,
-                             2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-        ks_minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
-                             2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-
-        def _normp(v):
-            v = v - v.mean()
-            return v / (np.linalg.norm(v) + 1e-9)
-
-        rows, major_flag, root_idx = [], [], []
-        for root in range(12):
-            rows.append(_normp(np.roll(ks_major, root))); major_flag.append(True); root_idx.append(root)
-            rows.append(_normp(np.roll(ks_minor, root))); major_flag.append(False); root_idx.append(root)
-        self._ks_mat = np.array(rows, dtype=np.float64)        # (24, 12) corrélation
-        self._ks_major = np.array(major_flag, dtype=bool)      # (24,)
-        self._ks_root = np.array(root_idx, dtype=np.int32)     # (24,)
-        # État lissé (l'harmonie est lente).
-        self._chroma = np.zeros(12, dtype=np.float64)
-        self._tonal_warmth = 0.0
-        self._key_root = 0
-        self._key_counter = 0
+        # (Les profils Krumhansl + la corrélation tonale (warmth/key) ont déménagé
+        #  dans MusicalAnalyzer.HarmonyAnalyzer. Ce moteur ne produit QUE le vecteur
+        #  chroma 12 classes — réduction GPU — que l'analyseur corrèle ensuite.)
 
     def _rebuild_chroma_matrix(self, tau):
         """(Re)construit la matrice chroma 12xN : chaque bin de la plage harmonique
@@ -1108,227 +899,11 @@ class AudioEngine:
             if abs(self._tuning_semitones - self._chroma_tau_applied) > self._TUNE_REBUILD:
                 self._rebuild_chroma_matrix(self._tuning_semitones)
 
-    def _update_harmony(self, chroma):
-        """Lisse le chroma, corrèle aux profils -> (tonal_warmth, key_hue).
-        warmth = meilleure corrélation MAJEUR − meilleure MINEUR (chaud vs froid) ;
-        key_hue = fondamentale du meilleur profil, avec hystérésis anti-clignotement."""
-        self._chroma += 0.025 * (chroma - self._chroma)        # ~0.5 s
-        c = self._chroma - self._chroma.mean()
-        nrm = float(np.linalg.norm(c))
-        if nrm < 1e-6:                                          # pas d'harmonie nette
-            self._tonal_warmth *= 0.98
-            return self._tonal_warmth, self._key_root / 12.0
-        scores = self._ks_mat @ (c / nrm)                      # (24,) corrélations
-        c_maj = float(scores[self._ks_major].max())
-        c_min = float(scores[~self._ks_major].max())
-        warmth_raw = (c_maj - c_min) * 2.0
-        if warmth_raw > 1.0:
-            warmth_raw = 1.0
-        elif warmth_raw < -1.0:
-            warmth_raw = -1.0
-        self._tonal_warmth += 0.02 * (warmth_raw - self._tonal_warmth)   # ~0.8 s
-        # Tonalité (teinte-maison) : hystérésis pour ne pas clignoter entre clés.
-        best = int(np.argmax(scores))
-        best_root = int(self._ks_root[best])
-        cur_score = float(scores[self._ks_root == self._key_root].max())
-        if best_root != self._key_root and float(scores[best]) > cur_score + 0.04:
-            self._key_counter += 1
-            if self._key_counter >= 3:
-                self._key_root = best_root
-                self._key_counter = 0
-        else:
-            self._key_counter = 0
-        return self._tonal_warmth, self._key_root / 12.0
-
-    # ------------------------------------------------------------------ #
-    #  Traqueur de PHRASE : détecte le BUILD (tension qui monte) et le DROP
-    #  (le sub qui claque après un build). Appelé à l'ANALYSE (signaux frais) ;
-    #  le lissage par-frame de build/drop vit dans _apply_tempo.
-    # ------------------------------------------------------------------ #
-    def _phrase_detect(self, high, centroid, snare, hat, bass, now):
-        # Tension = filtre ouvert (aigus + centroïde) + activité percussive haute.
-        act = 0.5 * (snare + hat)
-        tension = 0.40 * high + 0.30 * centroid + 0.30 * act
-        self._tension_fast += 0.06 * (tension - self._tension_fast)     # ~1 s
-        self._tension_slow += 0.012 * (tension - self._tension_slow)    # ~plusieurs s
-        self._bass_slow += 0.02 * (bass - self._bass_slow)
-
-        conf = self._tempo_conf
-        # BUILD = tension AU-DESSUS de sa ligne de base (= ça monte), porté par le
-        # verrou de tempo (aucun build sur de l'arythmique).
-        # Composante « ça monte » (tendance fast>slow) + bonus « tension haute
-        # soutenue » -> un build long et énergique charge vraiment, pas juste sa pente.
-        bt = (self._tension_fast - self._tension_slow) * 4.0
-        bt += 0.4 * max(0.0, self._tension_fast - 0.45)
-        if bt < 0.0:
-            bt = 0.0
-        elif bt > 1.0:
-            bt = 1.0
-        self._build_target = bt * conf
-
-        # DROP = le grave SLAMME de nouveau (surge vs ligne de base) ALORS qu'un
-        # build était chargé. Précondition build + surge + verrou + réfractaire.
-        bass_surge = bass - self._bass_slow
-        if (self._build > 0.30 and bass_surge > 0.22 and conf > 0.40
-                and (now - self._last_drop_t) > 2.0):
-            self._drop_env = 1.0
-            self._last_drop_t = now
-            self._phrase_beat = 0          # le drop = frontière de phrase
-            self._build = 0.0              # décharge immédiate
-            self._build_target = 0.0
-
-    # ------------------------------------------------------------------ #
-    #  Oscillateur de TEMPO/PHASE : entraînement au groove + anticipation.
-    #  Appelé à CHAQUE frame (même cache) pour que la phase avance en continu ;
-    #  ne corrige période/phase QUE sur un battement frais (`beat_now`).
-    # ------------------------------------------------------------------ #
-    def _apply_tempo(self, feats: "AudioFeatures", now: float, beat_now: bool) -> None:
-        # 1) Avance de la phase au temps réel écoulé depuis le dernier appel.
-        dt = now - self._tempo_last_t
-        self._tempo_last_t = now
-        if dt < 0.0:
-            dt = 0.0
-        elif dt > 0.5:
-            dt = 0.0   # gros trou (pause) -> on n'avance pas la phase d'un coup
-
-        period = self._tempo_period
-        self._tempo_phase += dt / max(period, 1e-3)
-        while self._tempo_phase >= 1.0:           # franchissement d'un temps prédit
-            self._tempo_phase -= 1.0
-            self._bar_count = (self._bar_count + 1) & 3   # 0..3 (mesure 4 temps)
-            self._phrase_beat = (self._phrase_beat + 1) % (self._phrase_bars * 4)
-
-        # 2) Correction sur un battement FRAIS (oscillateur adaptatif).
-        if beat_now:
-            # Erreur de phase e ∈ (-0.5, 0.5] : 0 = le beat tombe pile sur phase=0.
-            e = self._tempo_phase
-            if e > 0.5:
-                e -= 1.0
-            ae = abs(e)
-            # --- PÉRIODE par intervalle inter-onset (robuste, repliement d'octave)
-            # L'écart depuis le dernier battement EST une observation de période
-            # (ou un multiple) : on le replie sur l'octave la plus proche de notre
-            # estimation, puis EMA -> verrouillage en quelques battements.
-            if self._tempo_last_beat_t >= 0.0:
-                ioi = now - self._tempo_last_beat_t
-                if ioi > 0.05:
-                    if self._tempo_conf > 0.40:
-                        # SUIVI : on a un verrou -> replie l'IOI sur l'octave la
-                        # plus proche du tempo connu (absorbe beats manqués/en trop).
-                        while ioi < 0.75 * period:
-                            ioi *= 2.0
-                        while ioi > 1.50 * period:
-                            ioi *= 0.5
-                        beta = 0.20
-                    else:
-                        # ACQUISITION : pas encore de verrou -> on FAIT CONFIANCE à
-                        # l'IOI brut (juste replié dans la bande [60,200] BPM) et on
-                        # converge vite, sans biais vers la période par défaut.
-                        while ioi < 0.30:
-                            ioi *= 2.0
-                        while ioi > 1.00:
-                            ioi *= 0.5
-                        beta = 0.50
-                    if 0.28 <= ioi <= 1.05:
-                        period = (1.0 - beta) * period + beta * ioi
-                        if period < 0.30:
-                            period = 0.30
-                        elif period > 1.00:
-                            period = 1.00
-                        self._tempo_period = period
-            # --- PHASE : tire fermement la phase vers le battement (alignement).
-            self._tempo_phase -= 0.40 * e
-            if self._tempo_phase < 0.0:
-                self._tempo_phase += 1.0
-            elif self._tempo_phase >= 1.0:
-                self._tempo_phase -= 1.0
-            # --- CONFIANCE : forte quand les battements tombent régulièrement où
-            # on les prédit (petite erreur de phase). EMA -> entraînement progressif.
-            target = 1.0 - 2.5 * ae
-            if target < 0.0:
-                target = 0.0
-            self._tempo_conf += 0.12 * (target - self._tempo_conf)
-            self._tempo_last_beat_t = now
-        else:
-            # Pas de battement : si le pouls s'est tu, on PERD le verrou peu à peu.
-            if (self._tempo_last_beat_t >= 0.0
-                    and (now - self._tempo_last_beat_t) > 2.0 * period):
-                self._tempo_conf -= dt * 0.35   # ~3 s pour tout relâcher
-                if self._tempo_conf < 0.0:
-                    self._tempo_conf = 0.0
-
-        # 3) Anticipation : tension qui MONTE sur le dernier tiers avant le temps
-        #    fort prédit (l'inspir), nulle ailleurs, portée par la confiance.
-        ph = self._tempo_phase
-        w = 0.33
-        if ph > (1.0 - w):
-            tension = (ph - (1.0 - w)) / w
-            tension *= tension                 # ease-in (douceur croissante)
-        else:
-            tension = 0.0
-
-        # 4) Publication dans le snapshot (lu par particules + caméra).
-        conf = self._tempo_conf
-        feats.tempo_bpm = float(60.0 / max(self._tempo_period, 1e-3)) if conf > 0.05 else 0.0
-        feats.pulse_phase = float(self._tempo_phase)
-        feats.bar_phase = float((self._bar_count + self._tempo_phase) * 0.25)
-        feats.groove_conf = float(conf)
-        feats.anticipation = float(tension * conf)
-
-        # 5) PHRASE (échelle macro). La charge a une attaque LENTE (~2 s : "ça se
-        #    charge sur des mesures") et un release plus vif ; le drop s'épanouit
-        #    puis retombe. phrase_phase recalée au drop (cf. _phrase_detect).
-        if self._build_target > self._build:
-            self._build += (1.0 - math.exp(-dt / 1.2)) * (self._build_target - self._build)
-        else:
-            self._build += (1.0 - math.exp(-dt / 0.5)) * (self._build_target - self._build)
-        self._drop_env *= math.exp(-dt / 1.2)
-        feats.build = float(self._build)
-        feats.drop = float(min(self._drop_env, 1.0))
-        feats.phrase_phase = float((self._phrase_beat + self._tempo_phase)
-                                   / max(1, self._phrase_bars * 4))
-
-    # ------------------------------------------------------------------ #
-    #  Features « silence » : décroissance douce, spectrum_gpu valide.   #
-    # ------------------------------------------------------------------ #
-    def _silent_features(self) -> AudioFeatures:
-        """Cas « rien ne joue » : on fait décroître toutes les enveloppes vers
-        0 et on publie des features quasi nulles, en gardant un spectrum_gpu
-        valide (zéros lissés) pour ne pas casser le consommateur GPU."""
-        self._env_bands *= 0.85
-        self._env_amp *= 0.85
-        self._beat_env *= self._beat_decay
-        self._running_max_bands *= self._max_decay
-        self._running_max_amp *= self._max_decay
-
-        # Spectre GPU décroît doucement vers 0 (toujours en VRAM).
-        self._env_spectrum_gpu *= np.float32(0.85)
-        self._spectrum_max_gpu *= self._max_decay
-        cp.clip(self._env_spectrum_gpu, 0.0, 1.0, out=self._spectrum_out_gpu)
-        spectrum_gpu_frame = self._spectrum_out_gpu.copy()
-
-        # Onsets percussifs : simple décroissance (aucune attaque en silence).
-        kick_s = self._onset_kick.decay_only()
-        snare_s = self._onset_snare.decay_only()
-        hat_s = self._onset_hat.decay_only()
-        self._build_target = 0.0     # plus de tension en silence -> la charge se relâche
-        self._tonal_warmth *= 0.97   # plus d'harmonie -> retour au neutre (gris)
-
-        return AudioFeatures(
-            bass=float(self._env_bands[0]),
-            low_mid=float(self._env_bands[1]),
-            mid=float(self._env_bands[2]),
-            high=float(self._env_bands[3]),
-            amplitude=float(self._env_amp),
-            beat=float(min(self._beat_env, 1.0)),
-            is_beat=False,
-            centroid=0.0,
-            spectrum_gpu=spectrum_gpu_frame,
-            t=0.0,   # rempli par get_features()
-            kick=float(kick_s), snare=float(snare_s), hat=float(hat_s),
-            kick_hit=False, snare_hit=False, hat_hit=False,
-            tonal_warmth=float(self._tonal_warmth), key_hue=float(self._key_root / 12.0),
-        )
+    # (La corrélation tonale (_update_harmony), le traqueur de phrase
+    #  (_phrase_detect), l'oscillateur de tempo (_apply_tempo) et le chemin
+    #  « silence » (_silent_features) ont déménagé dans musical_analyzer.py
+    #  (HarmonyAnalyzer / RhythmTracker / MusicalAnalyzer). Le moteur ne fait
+    #  plus QUE l'acquisition + le lissage du spectre GPU.)
 
 
 # ===========================================================================

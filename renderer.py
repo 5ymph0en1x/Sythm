@@ -252,6 +252,15 @@ class Renderer:
         # Distance de base de la camera : cadre le papillon de Lorenz (demi-extent
         # ~2.5..3 en unites monde) depuis l'EXTERIEUR, pour voir sa structure 3D.
         self._cam_base_dist = 8.0
+        # Demi-cote de la BOITE de particules (= CLOUD_RADIUS), pose par l'Integrator
+        # apres construction (cf. renderer.box_radius dans main.py). Sert au mode camera
+        # "tunnel" pour placer l'oeil sur l'axe pres du bord proche.
+        self.box_radius = 3.5
+        # TUNNEL : fonction (z) -> (x, y) de l'AXE COURBE du tube, cablee par
+        # l'Integrator (renderer.tunnel_axis_fn = particles.tunnel_axis_at). La
+        # camera SUIT le serpent et s'INCLINE dans les virages. None = axe droit.
+        self.tunnel_axis_fn = None
+        self._tun_roll = 0.0       # roulis de virage lisse (banking)
         # Etat lisse du zoom reactif (evite les a-coups image a image).
         self._zoom_env = 0.0
         self._shake_env = 0.0
@@ -377,6 +386,7 @@ class Renderer:
         "auto": "auto",
         "beat_reactive": "beat",
         "beat": "beat",
+        "tunnel": "tunnel",       # vol DANS le tunnel (regard le long de l'axe Z)
     }
 
     def set_camera_mode(self, mode):
@@ -484,6 +494,19 @@ class Renderer:
         target = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
+        # MODE TUNNEL : on REMPLACE l'orbite externe par un vol DANS le tube, regard le
+        # long de l'axe (-Z), FOV elargi pour accentuer le point de fuite — et DILATE
+        # au drop (le saut en lumiere etire la perspective). On ecrit le FOV dans
+        # self._cam_fovy (et pas une variable locale) pour que les frustums STEREO
+        # off-axis (_eye_view_proj) voient le MEME champ : sinon le mode 3D rendait
+        # le tunnel avec le FOV standard de 45°.
+        if self.camera_mode == "tunnel":
+            eye, target, up = self._tunnel_camera(t, two_pi, bar_phase, conf,
+                                                  build, drop, pulse_peak)
+            self._cam_fovy = 78.0 + 12.0 * drop
+        else:
+            self._cam_fovy = 45.0
+
         # Memorise l'etat camera (rig central) pour deriver les frustums STEREO.
         self._cam_eye = eye
         self._cam_target = target
@@ -493,6 +516,40 @@ class Renderer:
                                   self._cam_near, self._cam_far)
         # view_proj = projection * vue (applique a une position monde homogene).
         self._view_proj = self._proj @ self._view
+
+    def _tunnel_camera(self, t, two_pi, bar_phase, conf, build, drop, pulse_peak):
+        """Camera DANS le tunnel : l'oeil VOLE SUR L'AXE COURBE du tube (le serpent
+        conduit par le Lorenz cache, via tunnel_axis_fn) pres du bord proche
+        (z ~ +L), regard le long de l'axe vers -Z, VERS LE VIRAGE a venir (point de
+        fuite au fond, enroule a l'infini). La camera S'INCLINE dans les virages
+        (banking lisse, comme un cockpit), POMPE en avant sur la pulsation predite
+        (lunge porte par le groove) ; le DROP plonge en avant (saut en lumiere), le
+        BUILD recule un peu (on se ramasse). Renvoie (eye, target, up)."""
+        L = float(getattr(self, "box_radius", 3.5))
+        look = 2.6                                        # distance de visee (plan de convergence 3D)
+        # Avance/recul : drop -> plonge ; build -> recule ; pulsation -> pompage.
+        ez = L - 1.3 * drop + 0.6 * build - 0.30 * conf * pulse_peak
+        # L'oeil sur l'axe COURBE (+ une respiration de main levee minuscule) ; la
+        # cible sur l'axe PLUS LOIN dans le tube -> on regarde DANS le virage.
+        axis = self.tunnel_axis_fn
+        if callable(axis):
+            ax_e, ay_e = axis(ez)
+            ax_t, ay_t = axis(ez - look)
+        else:
+            ax_e = ay_e = ax_t = ay_t = 0.0
+        sway = 0.025 * L
+        ex = ax_e + sway * math.sin(t * 0.37)
+        ey = ay_e + sway * math.sin(t * 0.29 + 1.1)
+        eye = np.array([ex, ey, ez], dtype=np.float32)
+        target = np.array([ax_t, ay_t, ez - look], dtype=np.float32)
+        # BANKING : roulis proportionnel au deport lateral du virage a venir
+        # (incline VERS l'interieur du virage), lisse pour rester organique ;
+        # + vrille lente continue + houle calee sur la mesure (portee par le groove).
+        bank_target = max(-0.55, min(0.55, 0.9 * (ax_t - ax_e)))
+        self._tun_roll += (bank_target - self._tun_roll) * 0.06
+        roll = t * 0.06 + 0.25 * conf * math.sin(two_pi * bar_phase) + self._tun_roll
+        up = np.array([math.sin(roll), math.cos(roll), 0.0], dtype=np.float32)
+        return eye, target, up
 
     def _eye_view_proj(self, eye_sign):
         """view_proj OFF-AXIS d'un oeil. eye_sign = -1 (gauche) / +1 (droit).

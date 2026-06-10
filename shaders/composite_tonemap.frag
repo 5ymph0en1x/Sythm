@@ -107,12 +107,17 @@ void main() {
 
     // --- 4. Vignette optionnelle -----------------------------------------
     if (u_enable_vignette == 1) {
-        // Distance au centre normalisee ; smoothstep pour un fondu doux.
+        // GEOMETRIE fixe (INDEPENDANTE de la force) : attenuation radiale douce,
+        // 1.0 au centre -> ~0.1 dans les coins. dist^2 evite un sqrt.
         vec2 d = v_uv - 0.5;
-        float dist = dot(d, d);  // rayon^2, evite un sqrt
-        float vig = smoothstep(0.75, 0.15, dist * u_vignette_strength);
-        // On garde un plancher pour ne jamais ecraser totalement les bords.
-        mapped *= mix(1.0, vig, u_vignette_strength > 0.0 ? 1.0 : 0.0);
+        float dist2 = dot(d, d);                      // rayon^2 (coin ~ 0.5)
+        float falloff = smoothstep(0.6, 0.1, dist2);  // 1 centre -> ~0 coins
+        // u_vignette_strength = QUANTITE d'assombrissement aux bords (0..1), et NON
+        // le rayon. Plancher (1 - s) -> les coins ne tombent jamais a zero, meme a
+        // s=1 (on clampe s pour eviter le noir pur a strength>1).
+        float s = clamp(u_vignette_strength, 0.0, 1.0);
+        float vig = 1.0 - s * (1.0 - falloff);
+        mapped *= vig;
     }
 
     // --- 5. Encodage sRGB pour l'affichage -------------------------------

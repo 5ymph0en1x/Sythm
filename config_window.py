@@ -41,6 +41,21 @@ DEFAULTS = {
     # Rythme & flux (particles.py, préfixe _)
     "_FIELD_STRENGTH": 0.9, "_TURB_BASE": 0.25, "_BREATH_OUT": 1.5,
     "_BUILD_CONVERGE": 1.6, "_DROP_BLOOM": 2.5, "_ACCEL_GAIN": 0.4,
+    # Mode COGNITIF : 0 = comportement d'origine (énergie physique) ; 1 = la nuée ne
+    # réagit qu'à la SONIE PERÇUE (isosonie + loudness). Cf. preset « Cognitive ».
+    "_PERCEPTUAL": 0.0,
+    # ONDES GRAVITATIONNELLES : force des fronts radiaux pilotés par la basse PROFONDE
+    # (0 = OFF). Plus la basse est deep, plus l'impact est général. Cf. « Cognitive ».
+    "_GRAV_WAVE": 0.0,
+    # TUNNEL HYPERSPACE : vol infini le long de l'axe (0 = OFF). _TUNNEL_WALL règle la
+    # netteté des parois (0 = volumétrique … grand = parois nettes) ; _TUNNEL_TWIST le
+    # gain de la VRILLE (le sens, lui, est conduit par le Lorenz caché). Cf. « Tunnel ».
+    "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0, "_TUNNEL_TWIST": 1.0,
+    # MANDELBULB : la nuée se condense sur la surface d'une fractale Mandelbulb
+    # calculée par particule (0 = OFF). _BULB_POWER = puissance n de base (8 =
+    # bulbe classique) ; _BULB_MORPH = amplitude de la métamorphose musicale de n.
+    # Cf. preset « Mandelbulb ».
+    "_BULB": 0.0, "_BULB_POWER": 8.0, "_BULB_MORPH": 1.0,
     # Couleur & harmonie (particles.py)
     "_TONAL_STRENGTH": 0.7, "_TONAL_GLOW": 0.25, "_WARMTH_HUE": 0.15, "_KEY_HUE_SPAN": 0.12,
     # Caméra & capture
@@ -85,6 +100,11 @@ GROUPS = [
         ("_BUILD_CONVERGE", "Build : charge", "float", (0.0, 4.0, 0.1)),
         ("_DROP_BLOOM", "Drop : explosion", "float", (0.0, 6.0, 0.25)),
         ("_ACCEL_GAIN", "Étincelle de cisaillement", "float", (0.0, 1.5, 0.05)),
+        ("_PERCEPTUAL", "Perceptuel (cognitif)", "float", (0.0, 1.0, 0.05)),
+        ("_GRAV_WAVE", "Ondes gravitationnelles", "float", (0.0, 4.0, 0.1)),
+        ("_TUNNEL", "Tunnel (hyperspace)", "float", (0.0, 2.0, 0.1)),
+        ("_TUNNEL_WALL", "Tunnel : parois", "float", (0.0, 2.0, 0.1)),
+        ("_TUNNEL_TWIST", "Tunnel : vrille", "float", (0.0, 2.0, 0.1)),
     ]),
     ("🎨  Couleur & harmonie", (1, 1), [
         ("_TONAL_STRENGTH", "Relief tonal", "float", (0.0, 2.0, 0.05)),
@@ -93,7 +113,7 @@ GROUPS = [
         ("_KEY_HUE_SPAN", "Teinte par tonalité", "float", (0.0, 0.4, 0.01)),
     ]),
     ("🎥  Caméra & capture", (1, 2), [
-        ("CAMERA_MODE", "Mode caméra", "choice", ["fixed", "auto_rotate", "beat_reactive"]),
+        ("CAMERA_MODE", "Mode caméra", "choice", ["fixed", "auto_rotate", "beat_reactive", "tunnel"]),
         ("CAMERA_ROTATE_SPEED", "Vitesse rotation", "float", (0.0, 1.0, 0.05)),
         ("RECORD_ENCODER", "Encodeur", "choice", ["nvenc", "x265"]),
         ("RECORD_FPS", "FPS capture", "int", (24, 120, 1)),
@@ -105,6 +125,11 @@ GROUPS = [
         ("STEREO_EYE_SEP", "Écart des yeux", "float", (0.0, 1.0, 0.01)),
         ("STEREO_CONVERGENCE", "Convergence", "float", (0.2, 3.0, 0.05)),
         ("STEREO_SWAP_EYES", "Inverser G/D", "bool", None),
+    ]),
+    ("🧊  Fractale", (1, 3), [
+        ("_BULB", "Mandelbulb (attraction)", "float", (0.0, 2.0, 0.1)),
+        ("_BULB_POWER", "Mandelbulb : puissance n", "float", (2.0, 16.0, 1.0)),
+        ("_BULB_MORPH", "Mandelbulb : métamorphose", "float", (0.0, 2.0, 0.1)),
     ]),
 ]
 
@@ -141,6 +166,10 @@ PRESETS = {
         "_BUILD_CONVERGE": 1.2,
         "_DROP_BLOOM": 1.8,
         "_TONAL_STRENGTH": 1.4,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
         "CAMERA_MODE": "auto_rotate",
         "CAMERA_ROTATE_SPEED": 0.08,
     },
@@ -156,6 +185,10 @@ PRESETS = {
         "_FIELD_STRENGTH": 0.65,
         "_TURB_BASE": 0.06,
         "_TONAL_STRENGTH": 0.35,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
         "CAMERA_MODE": "fixed",
     },
     "Énergétique": {
@@ -175,6 +208,10 @@ PRESETS = {
         "_DROP_BLOOM": 4.2,
         "_ACCEL_GAIN": 0.65,
         "_TONAL_STRENGTH": 0.6,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
         "CAMERA_MODE": "beat_reactive",
     },
     "Cosmique": {
@@ -193,6 +230,10 @@ PRESETS = {
         "_BREATH_OUT": 1.0,
         "_TONAL_STRENGTH": 1.9,
         "_TONAL_GLOW": 0.42,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
         "CAMERA_MODE": "auto_rotate",
         "CAMERA_ROTATE_SPEED": 0.045,
     },
@@ -211,7 +252,134 @@ PRESETS = {
         "_BUILD_CONVERGE": 0.9,
         "_DROP_BLOOM": 6.0,
         "_ACCEL_GAIN": 0.92,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
         "CAMERA_MODE": "beat_reactive",
+    },
+    # COGNITIVE — un TABLEAU DES FORCES SONORES, puissant et organiquement manifeste.
+    # L'analyse perceptuelle reste le MOTEUR (sonie d'isosonie + équilibre de bandes
+    # entendu -> la COULEUR dit quelle force domine), mais l'EXPRESSION devient une
+    # force : des ONDES GRAVITATIONNELLES (_GRAV_WAVE) parcourent toute la matière,
+    # pilotées par la basse PROFONDE « ressentie » (champ audio `sub`, NON pondéré
+    # isosonie) -> plus la basse est deep, plus l'impact est GÉNÉRAL. On ENTEND par la
+    # couleur, on RESSENT par la gravité. Les kicks profonds frappent « avec force »
+    # (fronts dopés par le sub), l'anticipation du rythme ramasse la nuée avant le
+    # temps fort. Le « nébuleux » (relief tonal, bloom, motion-blur) reste OFF -> les
+    # FORCES restent lisibles, pas un halo. _PERCEPTUAL un peu < 1 : un peu d'énergie
+    # physique revient pour le punch, la gravité portant tout le grave.
+    "Cognitive": {
+        "N_PARTICLES": 2_200_000,
+        "CLOUD_RADIUS": 4.0,
+        "PARTICLE_SIZE": 0.6,
+        "EXPOSURE": 0.20,
+        "EMIT_RATE": 3.0,
+        "EMITTED_LIFETIME": 12.0,
+        "ENABLE_BLOOM": False,
+        "ENABLE_MOTION_BLUR": False,
+        "_FIELD_STRENGTH": 0.85,
+        "_TURB_BASE": 0.14,
+        "_BREATH_OUT": 2.6,
+        "_BUILD_CONVERGE": 1.6,
+        "_DROP_BLOOM": 4.5,
+        "_ACCEL_GAIN": 0.3,
+        "_TONAL_STRENGTH": 0.0,
+        "_TONAL_GLOW": 0.0,
+        "_WARMTH_HUE": 0.18,
+        "_KEY_HUE_SPAN": 0.12,
+        "_PERCEPTUAL": 0.8,
+        "_GRAV_WAVE": 2.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 0.0,
+        "CAMERA_MODE": "beat_reactive",
+    },
+    # TUNNEL — vol HYPERSPACE infini dans un tube qui SERPENTE. L'axe du tunnel est
+    # une courbe vivante dont les virages sont l'état LISSÉ du Lorenz caché (jamais
+    # affiché — il tient le manche) ; la caméra le suit et S'INCLINE dans les virages.
+    # La dérive axiale fait FONCER la matière (boîte périodique en Z -> tunnel SANS
+    # FIN ; les TRAÎNÉES s'y enroulent AUSSI -> toutes les stries restent dans le
+    # tube, densité maximale). Le RYTHME devient des ANNEAUX de lumière qui balaient
+    # le tube vers la caméra : kick = anneau épais qui gonfle la paroi, snare =
+    # anneau qui la TORD, hat = anneau fin qui scintille. La vitesse s'emballe sur
+    # les basses/loudness ; le tube se resserre et se cristallise sur le build, puis
+    # le drop SAUTE EN LUMIÈRE : mur de lumière depuis le fond, tube qui se redresse
+    # et s'ouvre, FOV qui se dilate. La VRILLE (réglable : « Tunnel : vrille »)
+    # s'inverse organiquement, conduite par le Lorenz. Paroi assez nette (0.85),
+    # densifiée par le groove ; monter vers 1.5+ pour un tube chirurgical, baisser
+    # vers 0.3 pour un vortex volumétrique. Bloom + motion-blur ON = stries
+    # lumineuses ; caméra DANS le tube (mode "tunnel"). Exposition basse : avec
+    # l'enroulement des traînées, ~50 M de points sont VISIBLES en permanence.
+    "Tunnel": {
+        "N_PARTICLES": 2_000_000,
+        "CLOUD_RADIUS": 5.0,
+        "PARTICLE_SIZE": 0.5,
+        "EXPOSURE": 0.12,
+        "EMIT_RATE": 7.0,
+        "EMITTED_LIFETIME": 3.5,
+        "ENABLE_BLOOM": True,
+        "BLOOM_INTENSITY": 0.7,
+        "ENABLE_MOTION_BLUR": True,
+        "MOTION_BLUR_STRENGTH": 0.5,
+        "_FIELD_STRENGTH": 0.4,
+        "_TURB_BASE": 0.10,
+        "_BREATH_OUT": 0.0,
+        "_BUILD_CONVERGE": 0.0,
+        "_DROP_BLOOM": 0.0,
+        "_ACCEL_GAIN": 0.55,
+        "_TONAL_STRENGTH": 0.0,
+        "_TONAL_GLOW": 0.0,
+        "_WARMTH_HUE": 0.18,
+        "_KEY_HUE_SPAN": 0.12,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 1.0,
+        "_TUNNEL_WALL": 0.85,
+        "_TUNNEL_TWIST": 1.0,
+        "_BULB": 0.0,
+        "CAMERA_MODE": "tunnel",
+    },
+    # MANDELBULB — une fractale 3D VIVANTE, faite de millions de particules. Le
+    # kernel évalue le champ de distance du Mandelbulb (triplex z -> z^n + c) PAR
+    # PARTICULE : la nuée se CONDENSE sur la surface, le flot ABC (Lorenz caché)
+    # GLISSE le long de la coquille -> la fractale est un COURANT, pas une statue.
+    # La puissance n MUTE avec l'énergie musicale et le DROP précipite la
+    # métamorphose (la forme se restructure sous les yeux). La couleur suit
+    # l'orbit trap (chaque lobe sa teinte), la surface luit, les ondes de choc
+    # percussives RIPPLENT sur la coquille (épicentres = Lorenz), la respiration
+    # la fait inspirer/expirer, et le drop la DÉTONE (_DROP_BLOOM) avant qu'elle
+    # ne se recondense. Bloom doux + motion-blur léger = surface soyeuse ; caméra
+    # beat_reactive en orbite lente majestueuse. « Puissance n » (8 = classique)
+    # et « métamorphose » se règlent dans le panneau Fractale.
+    "Mandelbulb": {
+        "N_PARTICLES": 2_500_000,
+        "CLOUD_RADIUS": 3.2,
+        "PARTICLE_SIZE": 0.6,
+        "EXPOSURE": 0.09,
+        "EMIT_RATE": 5.0,
+        "EMITTED_LIFETIME": 2.5,
+        "ENABLE_BLOOM": True,
+        "BLOOM_INTENSITY": 0.5,
+        "ENABLE_MOTION_BLUR": True,
+        "MOTION_BLUR_STRENGTH": 0.35,
+        "_FIELD_STRENGTH": 0.5,
+        "_TURB_BASE": 0.15,
+        "_BREATH_OUT": 1.2,
+        "_BUILD_CONVERGE": 1.2,
+        "_DROP_BLOOM": 3.5,
+        "_ACCEL_GAIN": 0.6,
+        "_TONAL_STRENGTH": 0.0,
+        "_TONAL_GLOW": 0.0,
+        "_WARMTH_HUE": 0.18,
+        "_KEY_HUE_SPAN": 0.12,
+        "_PERCEPTUAL": 0.0,
+        "_GRAV_WAVE": 0.0,
+        "_TUNNEL": 0.0, "_TUNNEL_WALL": 0.0,
+        "_BULB": 1.0,
+        "_BULB_POWER": 8.0,
+        "_BULB_MORPH": 1.0,
+        "CAMERA_MODE": "beat_reactive",
+        "CAMERA_ROTATE_SPEED": 0.07,
     },
 }
 
@@ -222,6 +390,9 @@ PRESET_DESC = {
     "Énergétique": "Dense et réactif, bloom fort, ondes de choc marquées.",
     "Cosmique": "Grand espace, longues traînées, relief tonal fort, rotation lente.",
     "Percussif": "Rythme visible (fronts d’onde), bloom intense, caméra beat-reactive.",
+    "Cognitive": "Ne réagit qu'à la sonie PERÇUE (isosonie) ; net, sans nébuleux, anticipe le rythme.",
+    "Tunnel": "Vol hyperspace dans un tunnel SANS FIN qui SERPENTE (le Lorenz caché aux commandes) ; anneaux rythmiques, vrille, saut en lumière au drop.",
+    "Mandelbulb": "Fractale 3D VIVANTE : des millions de particules condensées sur la surface d'un Mandelbulb qui MUTE avec la musique ; ondes sur la coquille, explosion au drop.",
 }
 
 # ---------------------------------------------------------------------------
@@ -263,8 +434,16 @@ TR = {
         "Vitesse rotation": "Rotation speed", "Encodeur": "Encoder",
         "FPS capture": "Capture FPS", "Qualité (CQ/CRF)": "Quality (CQ/CRF)",
         "Presets visuels": "Visual presets", "Appliquer ce preset": "Apply preset",
+        "Perceptuel (cognitif)": "Perceptual (cognitive)",
+        "Ondes gravitationnelles": "Gravitational waves",
+        "Tunnel (hyperspace)": "Tunnel (hyperspace)", "Tunnel : parois": "Tunnel: walls",
+        "Tunnel : vrille": "Tunnel: twist",
+        "🧊  Fractale": "🧊  Fractal",
+        "Mandelbulb (attraction)": "Mandelbulb (attraction)",
+        "Mandelbulb : puissance n": "Mandelbulb: power n",
+        "Mandelbulb : métamorphose": "Mandelbulb: morphing",
         "Ambiant": "Ambient", "Minimal": "Minimal", "Énergétique": "Energetic",
-        "Cosmique": "Cosmic", "Percussif": "Percussive",
+        "Cosmique": "Cosmic", "Percussif": "Percussive", "Cognitive": "Cognitive", "Tunnel": "Tunnel",
         "Nuage doux, traînées longues, caméra lente, tonalité présente.":
             "Soft cloud, long trails, slow camera, present tonality.",
         "Faible densité, contraste net, pas d’effets, caméra fixe.":
@@ -275,6 +454,12 @@ TR = {
             "Vast space, long trails, strong tonal relief, slow rotation.",
         "Rythme visible (fronts d’onde), bloom intense, caméra beat-reactive.":
             "Visible rhythm (wavefronts), intense bloom, beat-reactive camera.",
+        "Ne réagit qu'à la sonie PERÇUE (isosonie) ; net, sans nébuleux, anticipe le rythme.":
+            "Reacts only to PERCEIVED loudness (equal-loudness); crisp, no nebulosity, anticipates the beat.",
+        "Vol hyperspace dans un tunnel SANS FIN qui SERPENTE (le Lorenz caché aux commandes) ; anneaux rythmiques, vrille, saut en lumière au drop.":
+            "Hyperspace flight through an ENDLESS, SNAKING tunnel (the hidden Lorenz at the helm); rhythm rings, twist, jump to lightspeed on the drop.",
+        "Fractale 3D VIVANTE : des millions de particules condensées sur la surface d'un Mandelbulb qui MUTE avec la musique ; ondes sur la coquille, explosion au drop.":
+            "LIVING 3D fractal: millions of particles condensed onto the surface of a Mandelbulb that MUTATES with the music; ripples across the shell, blast on the drop.",
     },
     "de": {
         "Sythm — Configuration": "Sythm — Konfiguration",
@@ -303,8 +488,16 @@ TR = {
         "Mode caméra": "Kameramodus", "Vitesse rotation": "Drehgeschwindigkeit",
         "Encodeur": "Encoder", "FPS capture": "Aufnahme-FPS", "Qualité (CQ/CRF)": "Qualität (CQ/CRF)",
         "Presets visuels": "Visuelle Presets", "Appliquer ce preset": "Preset anwenden",
+        "Perceptuel (cognitif)": "Perzeptuell (kognitiv)",
+        "Ondes gravitationnelles": "Gravitationswellen",
+        "Tunnel (hyperspace)": "Tunnel (Hyperspace)", "Tunnel : parois": "Tunnel: Wände",
+        "Tunnel : vrille": "Tunnel: Drall",
+        "🧊  Fractale": "🧊  Fraktal",
+        "Mandelbulb (attraction)": "Mandelbulb (Anziehung)",
+        "Mandelbulb : puissance n": "Mandelbulb: Potenz n",
+        "Mandelbulb : métamorphose": "Mandelbulb: Metamorphose",
         "Ambiant": "Ambient", "Minimal": "Minimal", "Énergétique": "Energetisch",
-        "Cosmique": "Kosmisch", "Percussif": "Perkussiv",
+        "Cosmique": "Kosmisch", "Percussif": "Perkussiv", "Cognitive": "Kognitiv", "Tunnel": "Tunnel",
         "Nuage doux, traînées longues, caméra lente, tonalité présente.":
             "Weiche Wolke, lange Spuren, langsame Kamera, präsente Tonalität.",
         "Faible densité, contraste net, pas d’effets, caméra fixe.":
@@ -315,6 +508,12 @@ TR = {
             "Weiter Raum, lange Spuren, starkes tonales Relief, langsame Drehung.",
         "Rythme visible (fronts d’onde), bloom intense, caméra beat-reactive.":
             "Sichtbarer Rhythmus (Wellenfronten), intensiver Bloom, beat-reaktive Kamera.",
+        "Ne réagit qu'à la sonie PERÇUE (isosonie) ; net, sans nébuleux, anticipe le rythme.":
+            "Reagiert nur auf die WAHRGENOMMENE Lautheit (Isophonie); klar, ohne Nebel, nimmt den Beat vorweg.",
+        "Vol hyperspace dans un tunnel SANS FIN qui SERPENTE (le Lorenz caché aux commandes) ; anneaux rythmiques, vrille, saut en lumière au drop.":
+            "Hyperraumflug durch einen ENDLOSEN, SCHLÄNGELNDEN Tunnel (der verborgene Lorenz am Steuer); Rhythmus-Ringe, Drall, Lichtsprung beim Drop.",
+        "Fractale 3D VIVANTE : des millions de particules condensées sur la surface d'un Mandelbulb qui MUTE avec la musique ; ondes sur la coquille, explosion au drop.":
+            "LEBENDES 3D-Fraktal: Millionen Partikel, kondensiert auf der Oberfläche eines Mandelbulbs, das mit der Musik MUTIERT; Wellen über die Schale, Explosion beim Drop.",
     },
     "it": {
         "Sythm — Configuration": "Sythm — Configurazione",
@@ -343,8 +542,16 @@ TR = {
         "Mode caméra": "Modo camera", "Vitesse rotation": "Velocità rotazione",
         "Encodeur": "Encoder", "FPS capture": "FPS cattura", "Qualité (CQ/CRF)": "Qualità (CQ/CRF)",
         "Presets visuels": "Preset visivi", "Appliquer ce preset": "Applica preset",
+        "Perceptuel (cognitif)": "Percettivo (cognitivo)",
+        "Ondes gravitationnelles": "Onde gravitazionali",
+        "Tunnel (hyperspace)": "Tunnel (iperspazio)", "Tunnel : parois": "Tunnel: pareti",
+        "Tunnel : vrille": "Tunnel: torsione",
+        "🧊  Fractale": "🧊  Frattale",
+        "Mandelbulb (attraction)": "Mandelbulb (attrazione)",
+        "Mandelbulb : puissance n": "Mandelbulb: potenza n",
+        "Mandelbulb : métamorphose": "Mandelbulb: metamorfosi",
         "Ambiant": "Ambient", "Minimal": "Minimale", "Énergétique": "Energico",
-        "Cosmique": "Cosmico", "Percussif": "Percussivo",
+        "Cosmique": "Cosmico", "Percussif": "Percussivo", "Cognitive": "Cognitivo", "Tunnel": "Tunnel",
         "Nuage doux, traînées longues, caméra lente, tonalité présente.":
             "Nuvola morbida, scie lunghe, camera lenta, tonalità presente.",
         "Faible densité, contraste net, pas d’effets, caméra fixe.":
@@ -355,6 +562,12 @@ TR = {
             "Grande spazio, scie lunghe, forte rilievo tonale, rotazione lenta.",
         "Rythme visible (fronts d’onde), bloom intense, caméra beat-reactive.":
             "Ritmo visibile (fronti d'onda), bloom intenso, camera beat-reactive.",
+        "Ne réagit qu'à la sonie PERÇUE (isosonie) ; net, sans nébuleux, anticipe le rythme.":
+            "Reagisce solo alla sonorità PERCEPITA (isofonia); nitido, senza nebulosità, anticipa il ritmo.",
+        "Vol hyperspace dans un tunnel SANS FIN qui SERPENTE (le Lorenz caché aux commandes) ; anneaux rythmiques, vrille, saut en lumière au drop.":
+            "Volo iperspaziale in un tunnel SENZA FINE che SERPEGGIA (il Lorenz nascosto al timone); anelli ritmici, torsione, salto nella luce al drop.",
+        "Fractale 3D VIVANTE : des millions de particules condensées sur la surface d'un Mandelbulb qui MUTE avec la musique ; ondes sur la coquille, explosion au drop.":
+            "Frattale 3D VIVENTE: milioni di particelle condensate sulla superficie di un Mandelbulb che MUTA con la musica; onde sul guscio, esplosione al drop.",
     },
     "es": {
         "Sythm — Configuration": "Sythm — Configuración",
@@ -383,8 +596,16 @@ TR = {
         "Mode caméra": "Modo de cámara", "Vitesse rotation": "Velocidad de rotación",
         "Encodeur": "Codificador", "FPS capture": "FPS de captura", "Qualité (CQ/CRF)": "Calidad (CQ/CRF)",
         "Presets visuels": "Presets visuales", "Appliquer ce preset": "Aplicar preset",
+        "Perceptuel (cognitif)": "Perceptivo (cognitivo)",
+        "Ondes gravitationnelles": "Ondas gravitacionales",
+        "Tunnel (hyperspace)": "Túnel (hiperespacio)", "Tunnel : parois": "Túnel: paredes",
+        "Tunnel : vrille": "Túnel: torsión",
+        "🧊  Fractale": "🧊  Fractal",
+        "Mandelbulb (attraction)": "Mandelbulb (atracción)",
+        "Mandelbulb : puissance n": "Mandelbulb: potencia n",
+        "Mandelbulb : métamorphose": "Mandelbulb: metamorfosis",
         "Ambiant": "Ambiente", "Minimal": "Minimal", "Énergétique": "Enérgico",
-        "Cosmique": "Cósmico", "Percussif": "Percusivo",
+        "Cosmique": "Cósmico", "Percussif": "Percusivo", "Cognitive": "Cognitivo", "Tunnel": "Túnel",
         "Nuage doux, traînées longues, caméra lente, tonalité présente.":
             "Nube suave, estelas largas, cámara lenta, tonalidad presente.",
         "Faible densité, contraste net, pas d’effets, caméra fixe.":
@@ -395,6 +616,12 @@ TR = {
             "Gran espacio, estelas largas, fuerte relieve tonal, rotación lenta.",
         "Rythme visible (fronts d’onde), bloom intense, caméra beat-reactive.":
             "Ritmo visible (frentes de onda), bloom intenso, cámara beat-reactive.",
+        "Ne réagit qu'à la sonie PERÇUE (isosonie) ; net, sans nébuleux, anticipe le rythme.":
+            "Reacciona solo a la sonoridad PERCIBIDA (isofónica); nítido, sin nebulosidad, anticipa el ritmo.",
+        "Vol hyperspace dans un tunnel SANS FIN qui SERPENTE (le Lorenz caché aux commandes) ; anneaux rythmiques, vrille, saut en lumière au drop.":
+            "Vuelo a hiperespacio por un túnel SIN FIN que SERPENTEA (el Lorenz oculto al mando); anillos rítmicos, torsión, salto a la luz en el drop.",
+        "Fractale 3D VIVANTE : des millions de particules condensées sur la surface d'un Mandelbulb qui MUTE avec la musique ; ondes sur la coquille, explosion au drop.":
+            "Fractal 3D VIVIENTE: millones de partículas condensadas en la superficie de un Mandelbulb que MUTA con la música; ondas en la concha, explosión en el drop.",
     },
 }
 

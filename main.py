@@ -530,6 +530,10 @@ def _run_session():
         )
         # Taille des particules (px écran) réglée depuis l'en-tête réglable.
         renderer.point_size = float(PARTICLE_SIZE)
+        # Demi-côté de la boîte -> le mode caméra "tunnel" place l'œil sur l'axe près
+        # du bord proche (cf. renderer._tunnel_camera).
+        if hasattr(renderer, "box_radius"):
+            renderer.box_radius = float(CLOUD_RADIUS)
         # Vitesse angulaire d'orbite (rad/s, modes auto/beat) : branche enfin
         # CAMERA_ROTATE_SPEED (jusqu'ici lu mais JAMAIS appliqué — l'angle était figé
         # à ~1 tour/40 s). 0 => orbite immobile en azimut.
@@ -554,6 +558,10 @@ def _run_session():
             CLOUD_RADIUS,
             EMITTED_LIFETIME,
         )
+        # TUNNEL : la caméra suit l'AXE COURBE du tube (le serpent conduit par le
+        # Lorenz caché, calculé par ParticleSystem). Câblage optionnel : absent ->
+        # None -> la caméra tunnel retombe sur l'axe droit (cf. renderer).
+        renderer.tunnel_axis_fn = getattr(particles, "tunnel_axis_at", None)
 
         # =====================================================================
         #  4) POST-PROCESSOR  — bloom / motion blur / tonemapping -> écran
@@ -799,7 +807,7 @@ class _LoopState:
 
 
 # Liste ordonnée des modes caméra pour le cyclage avec la touche C.
-_CAMERA_MODES = ("fixed", "auto_rotate", "beat_reactive")
+_CAMERA_MODES = ("fixed", "auto_rotate", "beat_reactive", "tunnel")
 
 
 def _install_key_toggles(window, state, postfx, renderer):
@@ -903,7 +911,7 @@ def _print_controls():
         "  ESC : quitter\n"
         "  B   : activer/désactiver le bloom\n"
         "  M   : activer/désactiver le motion blur\n"
-        "  C   : changer de mode caméra (fixed / auto_rotate / beat_reactive)\n"
+        "  C   : changer de mode caméra (fixed / auto_rotate / beat_reactive / tunnel)\n"
         "  F   : plein écran borderless (HDR préservé) (bascule)\n"
         "  R   : démarrer/arrêter l'enregistrement HEVC (x265/NVENC)\n"
         "============================\n",
